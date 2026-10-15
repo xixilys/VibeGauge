@@ -24,6 +24,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var autoCleanTimer: Timer?
 
     private var currentReport = ScanReport()
+    private var isPanelOpen = false
+    private var isRelayoutScheduled = false
+    private var lastStatusImage: (percentage: Int, alert: Bool)?
     private weak var hostingView: SwipeHostingView<DashboardView>?
     private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "menu")
 
@@ -51,12 +54,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DashboardView.migrateTabSelection()
         NetworkScanner.shared.start()
         UsageHistory.shared.start()
+        NerfDetector.shared.start()
+        autoSyncPricesIfStale()
         DispatchQueue.global(qos: .utility).async { ProxyManager.shared.syncIfInstalled() }   // 包里脚本更新了就热替换
         updateStatus()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: true) { [weak self] _ in
+        let statusTimer = Timer(timeInterval: 8.0, repeats: true) { [weak self] _ in
             self?.updateStatus()
         }
+        statusTimer.tolerance = 1
+        RunLoop.main.add(statusTimer, forMode: .common)  // 菜单 tracking 时也继续采集，面板读取同一份报告。
+        timer = statusTimer
 
         setupAutoCleanTimer()
         setupWakeObserver()
@@ -184,8 +192,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    func menuWillOpen(_ menu: NSMenu) { installSwipeMonitor() }
-    func menuDidClose(_ menu: NSMenu) { removeSwipeMonitor() }
+    func menuWillOpen(_ menu: NSMenu) {
+        isPanelOpen = true
+        installSwipeMonitor()
+        relayoutMenuPanel()
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        isPanelOpen = false
+        removeSwipeMonitor()
+        // NSMenu 会保留自定义视图；明确释放它，取消 SwiftUI 的 Timer 订阅和视图状态。
+        for item in menu.items { item.view = nil }
+        menu.removeAllItems()
+        hostingView = nil
+    }
 
     private var isScanning = false
 
@@ -213,7 +232,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - 芯片框架图标 (内嵌居中数字)
-    private func renderChipFrameImage(percentage: Int) -> NSImage {
+    private func renderChipFrameImage(percentage: Int, alert: Bool = false) -> NSImage {
         let width: CGFloat = 25.0
         let height: CGFloat = 22.0
 
@@ -267,6 +286,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let textY = bodyY + (bodyHeight - textSize.height) / 2.0
             let textRect = NSRect(x: bodyX, y: textY, width: bodyWidth, height: textSize.height)
             text.draw(in: textRect, withAttributes: attrs)
+
+            // 5. 降智告警：右上角实心圆点（模板图只能单色，靠形状提示）
+            if alert {
+                let dot = NSRect(x: width - 7.5, y: height - 7.5, width: 7, height: 7)
+                NSColor.black.setFill()
+                NSBezierPath(ovalIn: dot).fill()
+            }
             return true
         }
 
@@ -279,15 +305,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderStatusButton(report: ScanReport) {
         evaluateExitChanges()
         guard let button = statusItem.button else { return }
-        button.image = renderChipFrameImage(percentage: report.freePercentage)
-        button.imagePosition = .imageOnly
-        button.title = ""
-        button.attributedTitle = NSAttributedString(string: "")
+        let health = NerfDetector.shared.snapshot()
+        let alert = health.status == .alert
+        if lastStatusImage?.percentage != report.freePercentage || lastStatusImage?.alert != alert {
+            button.image = renderChipFrameImage(percentage: report.freePercentage, alert: alert)
+            button.imagePosition = .imageOnly
+            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "")
+            lastStatusImage = (report.freePercentage, alert)
+        }
 
         let signals = report.pressures
-        button.toolTip = (["VibeGauge · 内存可用 \(report.freePercentage)%", "—— 以下为已用 %（越高越紧）——"]
-                          + signals.prefix(8).map { "\($0.short)  \($0.pct)%" + ($0.level > 0 ? "  ⚠︎" : "") }).joined(separator: "\n")
+        var tip = ["VibeGauge · 内存可用 \(report.freePercentage)%", "模型健康：\(health.status.label) · \(health.headline)"]
+        if let f = UsageHistory.shared.snapshot().forecast, f.hasData {
+            tip.append("今天 API 等价 \(Fmt.money(f.todaySoFar, f.currency))，预计 \(Fmt.money(f.todayProjected, f.currency))")
+        }
+        tip.append("—— 以下为已用 %（越高越紧）——")
+        let toolTip = (tip + signals.prefix(8).map { "\($0.short)  \($0.pct)%" + ($0.level > 0 ? "  ⚠︎" : "") }).joined(separator: "\n")
+        if button.toolTip != toolTip { button.toolTip = toolTip }
         evaluateThresholds(signals)
+        evaluateNerf(health)
     }
 
     // MARK: - 阈值通知
@@ -368,6 +405,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static let notifyCooldown: TimeInterval = 4 * 3600
+
+    // MARK: - 降智告警通知
+    // 只报「硬证据」，每条只报一次；启动后第一轮只建基线（历史证据不在每次开机时再吼一遍）。
+    private var nerfSeeded = false
+    private let nerfNotifiedKey = "vg.nerfNotified"
+
+    private func evaluateNerf(_ report: NerfReport) {
+        guard report.capturedAt > 0 else { return }
+        let firstRun = !nerfSeeded
+        nerfSeeded = true
+        var seen = Set(UserDefaults.standard.stringArray(forKey: nerfNotifiedKey) ?? [])
+        let hard = report.findings.filter { $0.severity == .hard }
+        let fresh = hard.filter { !seen.contains($0.id) }
+        guard !fresh.isEmpty else { return }
+        for f in fresh { seen.insert(f.id) }
+        UserDefaults.standard.set(Array(seen.suffix(300)), forKey: nerfNotifiedKey)
+        if firstRun { return }
+        guard isThresholdNotifyEnabled else { return }
+        let now = Date().timeIntervalSince1970
+        for f in fresh.prefix(3) where now - f.timestamp < 3600 {
+            sendNotification(title: "⚠️ 疑似降智 · \(f.source)", body: "\(f.title)：\(f.detail)" + (f.session.isEmpty ? "" : "（\(f.session)）"))
+        }
+    }
     private let notifyStateKey = "vg.notifyState"       // [key: "level|lastAt"]
 
     private func loadNotifyState() {
@@ -393,8 +453,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 菜单弹出直接用 ≤8s 前的缓存快照，主线程不做任何扫描；DashboardView.onAppear 会立刻在后台刷一次
         let report = currentReport
 
-        // 面板（Tab 切换，高度随当前 Tab 内容自适应，超过屏幕才滚动）。所有动作都在面板里，菜单只留退出。
+        // 面板（Tab 切换，高度随当前 Tab 内容自适应，超过屏幕才滚动）。所有动作（含同步价格、字号、退出）都在面板底栏。
         var actions = PanelActions()
+        actions.latestReport = { [weak self] in self?.currentReport }
+        actions.isVisible = { [weak self] in self?.isPanelOpen == true }
         actions.cleanOrphans = { [weak self] in
             self?.menu.cancelTracking()
             self?.cleanOrphansAction()
@@ -404,10 +466,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.cleanNPXAction()
         }
         actions.rescan = { [weak self] in self?.updateStatus() }
+        actions.syncPrices = { [weak self] completion in
+            guard let self else { completion(L("应用不可用", "App unavailable"), false); return }
+            self.runPriceSync(notifyWhenUnchanged: false, completion: completion)
+        }
+        actions.quit = { [weak self] in self?.quitAction() }
         actions.setAutoClean = { [weak self] on in self?.isAutoCleanEnabled = on }
         actions.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
         actions.setThresholdNotify = { [weak self] on in self?.isThresholdNotifyEnabled = on }
         actions.setExitChangeNotify = { [weak self] on in self?.isExitChangeNotifyEnabled = on }
+        actions.setFontScale = { value in UserDefaults.standard.set(value, forKey: UITheme.scaleKey) }
         actions.installProxy = { [weak self] in
             self?.menu.cancelTracking()
             self?.installProxy()
@@ -428,7 +496,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings: PanelSettings(autoClean: isAutoCleanEnabled,
                                     launchAtLogin: isLaunchAtLoginEnabled(),
                                     thresholdNotify: isThresholdNotifyEnabled,
-                                    exitChangeNotify: isExitChangeNotifyEnabled),
+                                    exitChangeNotify: isExitChangeNotifyEnabled,
+                                    fontScale: Double(UITheme.fontScale)),
             actions: actions
         )
 
@@ -441,20 +510,68 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cardItem.view = hosting
         menu.addItem(cardItem)
 
-        menu.addItem(NSMenuItem.separator())
+    }
 
-        let quitItem = NSMenuItem(title: "退出 VibeGauge", action: #selector(quitAction), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
+    /// 选字号：写进 UserDefaults 后关掉菜单；下次打开会按新倍率重建面板（面板在 menuNeedsUpdate 里重建）。
+    @objc private func setFontScaleAction(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        UserDefaults.standard.set(value, forKey: UITheme.scaleKey)
+        menu.cancelTracking()
+    }
+
+    /// 手动补齐缺价并刷新来源明确的自动价；内置规则和手动覆盖仍由统一引擎决定。
+    @objc private func syncPricesAction() {
+        menu.cancelTracking()
+        runPriceSync(notifyWhenUnchanged: true)
+    }
+
+    /// 启动时若距上次同步超过 7 天就后台补一次；失败静默，绝不打扰。
+    private func autoSyncPricesIfStale() {
+        let path = PriceSync.pricesPath(home: FileManager.default.homeDirectoryForCurrentUser.path)
+        var last: Date?
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let sync = root["_sync"] as? [String: Any], let at = sync["at"] as? String {
+            last = ISO8601DateFormatter().date(from: at)
+        }
+        guard last.map({ Date().timeIntervalSince($0) > 7 * 86400 }) ?? false else { return }
+        runPriceSync(notifyWhenUnchanged: false)
+    }
+
+    private func runPriceSync(notifyWhenUnchanged: Bool, completion: ((String, Bool) -> Void)? = nil) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let outcome = PriceSync.sync(home: FileManager.default.homeDirectoryForCurrentUser.path)
+            let changed = !outcome.added.isEmpty || !outcome.updated.isEmpty
+            if changed { UsageHistory.shared.refreshSoon() }
+            DispatchQueue.main.async {
+                let message: String
+                if !outcome.error.isEmpty { message = outcome.error }
+                else if changed {
+                    message = L("新增 \(outcome.added.count) 个，更新 \(outcome.updated.count) 个。", "Added \(outcome.added.count), updated \(outcome.updated.count).")
+                        + (outcome.skipped.isEmpty ? "" : L("仍有 \(outcome.skipped.count) 个模型缺价。", " \(outcome.skipped.count) models still have no rate."))
+                } else {
+                    message = outcome.skipped.isEmpty ? L("没有需要更新的自动价格。自定义覆盖已保留。", "No synced rates need updating. Custom overrides were kept.")
+                        : L("这些模型仍未找到价格：\(outcome.skipped.prefix(4).joined(separator: ", "))", "No rates found for: \(outcome.skipped.prefix(4).joined(separator: ", "))")
+                }
+                if let completion { completion(message, outcome.error.isEmpty) }
+                else if notifyWhenUnchanged || changed {
+                    self?.sendNotification(title: outcome.error.isEmpty ? L("价格同步结果", "Pricing sync result") : L("价格同步失败", "Pricing sync failed"), body: message)
+                }
+            }
+        }
     }
 
     /// 内容高度变了（切 Tab / 数据到达 / 卡片增减）→ 按新 fittingSize 改 frame。
     /// 实测 macOS 14：NSMenu 打开后会跟着自定义视图的 frame 实时重排（菜单窗口高度随之变），不需要关掉重开。
     private func relayoutMenuPanel() {
+        guard isPanelOpen, !isRelayoutScheduled else { return }
+        isRelayoutScheduled = true
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let h = self.hostingView else { return }
+            guard let self else { return }
+            self.isRelayoutScheduled = false
+            guard self.isPanelOpen, let h = self.hostingView else { return }
             let size = h.fittingSize
-            guard abs(size.height - h.frame.height) > 1 else { return }
+            guard abs(size.height - h.frame.height) > 1 || abs(size.width - h.frame.width) > 1 else { return }
             let before = h.window?.frame.height ?? -1
             h.frame.size = size
             self.log.debug("relayout fitting=\(Int(size.height)) menuWindow before=\(Int(before))")

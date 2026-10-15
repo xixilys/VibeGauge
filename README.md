@@ -58,10 +58,13 @@ When using autonomous coding agents like **Claude Code**, **OpenAI Codex**, **Go
   - Optional silent background sweep every 30 minutes.
 - ⏱️ **Unified AI Quota & Reset Timers**:
   - **Claude**: Captures subscription tier (Max 5x / Max 20x / Pro / Team), 5-hour percentage, 7-day quota, and exact countdown to reset.
-  - **Codex**: Detects primary `codex` bucket usage, identifies `usage_limit_exceeded` exact unlock timestamps, and supports optional passwordless SSH synchronization from remote dev machines.
+  - **Codex**: Detects primary `codex` bucket usage, identifies `usage_limit_exceeded` exact unlock timestamps, and supports optional passwordless SSH synchronization from multiple remote dev machines (WSL, Linux, other Macs).
   - **Gemini / Antigravity**: Tracks official and 3rd-party quota pools with respective reset dates.
   - **Grok**: Reads weekly credit usage and billing cycle reset boundaries.
   - **Local Model Probing**: Detects running Ollama / LM Studio instances and active models.
+- 🧮 **opencode & Chinese-model usage**:
+  - Reads opencode's local SQLite database per message, so DeepSeek / GLM / Kimi and other models opencode drives are counted in the Statistics tab.
+  - Optional password-less SSH pull from WSL / Linux / other Macs, with usage tagged per host (e.g. `OpenCode · wsl-box`).
 - 📈 **Today's Token Analytics & Prompt Cache ROI**:
   - Aggregated daily stats: hundreds of millions in context tokens, output tokens, and thinking/reasoning tokens.
   - Real-time Prompt Cache hit rate calculations (e.g. 97.4% hit rate).
@@ -76,6 +79,16 @@ When using autonomous coding agents like **Claude Code**, **OpenAI Codex**, **Go
   - Adaptive panel height with **two-finger trackpad swipe** to switch tabs smoothly.
 
 ---
+
+
+### New in this version
+
+- **One overview across Herdr devices**: enabled Herdr SSH machines are discovered automatically and merged with manual `remoteHosts`. Claude, Codex, Grok and Antigravity quota readings are grouped by platform and labelled by device. Account percentages are never added together; expired, undated, unavailable and retained readings are distinguished. Collection is read-only and uses existing SSH connections without changing credentials or providers. Coverage depends on the metadata available from each CLI.
+- **Clearer daily statistics**: fresh input and cached input are shown separately; reasoning remains a subset of output. API-equivalent estimates sit below usage and remain separate from subscription bills. Local history appears before slow remote scans finish, and failed refreshes retain their history with a visible explanation.
+- **Daily API-equivalent cost & forecast** (ccusage-compatible accounting): a dated reference catalog (`Resources/prices.builtin.json`) includes newly verified official OpenAI rates; other entries retain their reference sources. Your `prices.json` always wins. The **Prices** page shows input, output and cache rates, sources and long-context rules. Built-in models account for supported cache, long-context and Fast tiers; custom rates follow their explicit override rules. Claude and Codex requests are de-duplicated, including archived rollout copies and replayed fork usage. Today's estimate uses the 28-day hourly profile; monthly extrapolation requires at least seven prior recorded days, otherwise month-to-date is shown. Device filters apply to costs, forecasts and the heatmap.
+- **WSL / Linux / other-Mac daily usage**: `remoteHosts` (SSH, incremental, compressed, only `python3` needed remotely) or `mountRoots` (`label=/mounted/home`, read directly). Switch devices at the top of the panel.
+- **Model "nerf" detection** (inspired by [is-gpt-nerfed](https://github.com/kiyoakii/is-gpt-nerfed), passive, 0 tokens): silent model swaps, reasoning-effort drops, hidden internal models and shrinking context windows in Codex; Claude Code switching to a smaller tier without `/model`; unusually short answers vs your 2-week median. If is-gpt-nerfed is installed its ModelTrace fingerprint verdicts are shown too. Hard evidence adds a dot to the menu bar icon and sends a notification.
+- **macOS-style panel**: HIG type scale, continuous-corner cards, System Settings–style icons, SF Symbols, monospaced digits, light & dark. `VibeGauge --render-panel <dir>` renders every page to PNG.
 
 ## 🚀 Quick Start
 
@@ -124,15 +137,18 @@ open VibeGauge.app
 
 All subscription tiers, quotas, and token metrics are read strictly from local session logs or vendor cache files:
 
+Token totals and API-equivalent costs cover collected local, SSH and mounted-device session records. **All** combines those devices' daily tokens; after the first history scan, it uses the same daily records as Statistics, including archived sessions. **Codex cloud tasks started by Dot are not yet included.** Executing their tools on a Mac does not produce local model-usage logs. Missing cloud usage is unknown, not zero, and is not inferred from quota percentages or context length.
+
 | Provider | Plan Detection | Quotas & Reset Timestamps | Update Frequency |
 |:---|:---|:---|:---|
 | **Claude** | `~/.claude.json`<br>(e.g. `max_5x`, `max_20x`, `pro`) | `~/.claude/claude-usage.json`<br>(Statusline-intercepted 5h / 7d rates & reset points) | Automatically updates on every dialogue round |
 | **Codex** | `~/.codex/auth.json`<br>(JWT `chatgpt_plan_type`) | Session jsonl `rate_limits`<br>(Extracts exact unlock time from `task_complete` errors) | Updates only when requests are actively sent |
 | **Gemini** | Local auth token verification | `~/.cache/agy-hud/quota_cache.json`<br>(Split by primary & 3rd-party model pools) | Refreshed by background helper while agy runs |
 | **Grok** | `~/.grok/settings_cache.json` | `~/.grok/logs/unified.jsonl`<br>(Latest billing credits config & period end) | Periodically flushed by Grok CLI |
+| **opencode** | opencode's own SQLite DB<br>(`providerID` / `modelID` per message) | Non-quota based<br>(`~/.local/share/opencode/opencode.db`, per-message tokens) | Re-read in full on each Statistics scan |
 | **Ollama** | Local socket & process probe | Non-quota based (monitors active on-device models) | Instant live status |
 
-> 📌 *Note*: Footnotes such as "Recorded 1h ago" represent the **timestamp when the vendor CLI last refreshed its local log**, not a lag in VibeGauge. VibeGauge's incremental delta-scanner runs in ~100ms when the panel is open.
+> 📌 *Note*: Footnotes such as "Recorded 1h ago" represent the **timestamp when the vendor CLI last refreshed its local log**, not a lag in VibeGauge. The panel reads existing snapshots every five seconds while open and releases its view when closed. Process and quota collection runs every eight seconds, including while the menu is open; the panel does not start a duplicate scanner. Unchanged menu-bar icons are reused.
 
 ---
 
@@ -143,9 +159,10 @@ The panel has five tabs: **Subscriptions / API / Statistics / Network / System**
 - **Network** probes only each AI domain's `/cdn-cgi/trace` endpoint (Anthropic, ChatGPT, OpenAI API and Grok), once per minute with fresh connections. Gemini has no trace endpoint; its route is shown only when the local clash connection table contains an active connection. Failures remain visible as unavailable.
 - The local clash API is read every 10 seconds (`clashAPI`, default `http://127.0.0.1:9090`; optional `clashSecret`). Only loopback addresses are accepted. Local interface, route and DNS information refresh every 30 seconds; byte counters are sampled at least two seconds apart. No network configuration is changed.
 - Every 10 minutes, an IPv6-only request to Cloudflare's trace endpoint checks IPv6 reachability, and local resolver addresses are checked for possible DNS leakage. These are indicators, not proof that all traffic follows the same route. Exit-change notifications are enabled by default, with a 10-minute cooldown per AI.
-- **Statistics** reads local Claude, Codex and API proxy logs in the background, then updates incrementally every five minutes. Claude requests are deduplicated across files; Codex uses per-request usage when available and cumulative differences otherwise. Events are grouped by their timestamps in the local timezone.
-- History is stored in `~/.config/vibegauge/usage-daily.json`. Removing old logs retains their already-cached history; rewriting a file replaces its contribution. Session counts are distinct log files. CLI and API proxy sources can include the same call and are not deduplicated against each other.
-- API-equivalent cost uses only `~/.config/vibegauge/prices.json`. Unpriced models are explicitly excluded; there are no built-in production prices. Token totals include cached input and output; reasoning tokens are part of output.
+- **Statistics** reads local Claude, Codex, opencode and API proxy logs in the background, then updates incrementally every five minutes. Claude requests are deduplicated across files; Codex uses per-request usage when available and cumulative differences otherwise. opencode's database is re-read in full each scan (the message table is small) and its rows are keyed by message id, so re-reading never double counts. Events are grouped by their timestamps in the local timezone.
+- Remote hosts configured via `remoteHosts` are pulled over password-less SSH. Codex quota is merged across all of them; opencode usage is fetched incrementally (`time_updated` cursor, with a full re-pull at least once a day). A host that fails keeps its previously cached contribution instead of being zeroed, and its status is shown in the Codex detail rows.
+- History is stored in `~/.config/vibegauge/usage-daily.json`. Removing old logs retains their already-cached history; rewriting a file replaces its contribution. Session counts are distinct log files, or distinct opencode session ids for opencode sources. CLI and API proxy sources can include the same call and are not deduplicated against each other.
+- API-equivalent costs use custom `~/.config/vibegauge/prices.json` rates first, then the built-in reference catalog. [GPT-6.1 Sol's verified official rates](https://developers.openai.com/api/docs/models/gpt-6.1-sol) are $2 input, $0.10 cached input, $2.50 cache write and $10 output per million tokens; long-context and Fast rules apply to the built-in entry. Custom rows do not inherit those multipliers. Set `fast_multiplier` on a custom row to explicitly surcharge recorded `priority` / `fast` requests (for example, `2` for Astra). Missing or `1` means no extra surcharge, including rows whose price already includes Fast. The factor applies once to input, cache and output after peak/off-peak selection. Each row may set `currency`; currencies stay separate. `_peak` and `offpeak` support time-of-day rates. The Prices page or `VibeGauge --sync-prices` fills missing rates from models.dev and refreshes unchanged, traceable synced rows. Manual and legacy rows without provenance are preserved; writes are backed up and stopped if the file changes during sync. Unpriced models remain excluded. Token totals include cached input and output; reasoning is included in output.
 
 No prompts or usage logs are uploaded by these features. Network probes necessarily make the outbound requests described above. The optional existing API proxy and remote Codex synchronization retain their own behavior. `--selftest` skips remote SSH, exercises parsing and incremental-cache fixtures, and prints masked network and real historical summaries.
 
@@ -204,7 +221,7 @@ curl -fsSL https://raw.githubusercontent.com/MaxHaiCom/vibe-gauge/main/Resources
 | `logRetentionDays` | `30` | Session logs older than this are offered for cleanup (min 7) |
 | `clashAPI` | `http://127.0.0.1:9090` | Clash / mihomo / sing-box controller for the Network tab (loopback only) |
 | `clashSecret` | — | Controller secret, if you set one |
-| `codexRemoteHost` | off | `user@host` with password-less SSH; merges Codex quota from another Mac |
+| `remoteHosts` | off | Space/comma-separated `user@host` list with password-less SSH; merges Codex quota and opencode usage from WSL / Linux / other Macs. The old single-host `codexRemoteHost` key is still accepted |
 
 ---
 

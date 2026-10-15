@@ -25,19 +25,19 @@ public struct NetworkTabView: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("网络")
-                    .font(.system(size: 12, weight: .bold))
+                Text("网络出口与泄漏")
+                    .font(VG.headline)
                 Spacer()
                 if snapshot.isRefreshing { ProgressView().controlSize(.mini) }
                 Button(action: onRetest) {
-                    Image(systemName: "arrow.clockwise").font(.system(size: 9, weight: .semibold))
+                    Image(systemName: "arrow.clockwise").font(VG.scaled(9, weight: .semibold))
                 }
                 .buttonStyle(.plain)
                 .help("立即重测（10 秒内最多一次）")
             }
             .padding(.horizontal, 10)
             Text(exitSummary)
-                .font(.system(size: 10, weight: .medium))
+                .font(VG.scaled(10, weight: .medium))
                 .foregroundColor(exitSummary.contains("不一致") ? .orange : .secondary)
                 .lineLimit(2)
                 .padding(.horizontal, 10)
@@ -50,17 +50,20 @@ public struct NetworkTabView: View {
         .frame(width: width, alignment: .leading)
     }
 
+    private static let symbols = ["AI 出口": "globe.asia.australia.fill", "代理内核": "arrow.triangle.branch", "本机": "wifi", "泄漏体检": "shield.lefthalf.filled"]
+    private static let tints: [String: Color] = ["AI 出口": .blue, "代理内核": .indigo, "本机": .teal, "泄漏体检": .green]
+
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                VGIcon(symbol: Self.symbols[title] ?? "network", tint: Self.tints[title] ?? .blue)
+                Text(title).font(VG.headline)
+            }
             content()
         }
         .padding(10)
         .frame(width: width, alignment: .leading)
-        .background(Color.secondary.opacity(0.06))
-        .cornerRadius(8)
+        .vgFill(0.06, radius: 8)
     }
 
     private var aiExitSection: some View {
@@ -68,67 +71,67 @@ public struct NetworkTabView: View {
             ForEach(snapshot.aiExits) { item in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
-                        Text(item.name).font(.system(size: 10.5, weight: .medium)).frame(width: 78, alignment: .leading)
+                        Text(item.name).font(VG.scaled(10.5, weight: .medium)).frame(width: 78, alignment: .leading)
                         if item.isGemini {
                             Text("由活动连接判断")
-                                .font(.system(size: 9.5, design: .monospaced)).foregroundColor(.secondary)
+                                .font(VG.scaled(9.5, design: .monospaced)).foregroundColor(.secondary)
                         } else if !item.error.isEmpty {
-                            Text("查不到").font(.system(size: 9.5)).foregroundColor(.orange)
+                            Text("查不到").font(VG.scaled(9.5)).foregroundColor(.orange)
                                 .help(item.error)
                         } else {
                             Text(item.ip.isEmpty ? "查不到" : item.ip)
-                                .font(.system(size: 9.5, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                                .font(VG.scaled(9.5, design: .monospaced)).lineLimit(1).truncationMode(.middle)
                                 .help(item.ip.isEmpty ? "未检测到出口 IP" : item.ip)
                         }
                         Spacer(minLength: 0)
                         if item.changed {
-                            Text("变过").font(.system(size: 8, weight: .bold)).padding(.horizontal, 3).padding(.vertical, 1)
+                            Text("变过").font(VG.scaled(8, weight: .bold)).padding(.horizontal, 3).padding(.vertical, 1)
                                 .background(Color.orange.opacity(0.18)).foregroundColor(.orange).cornerRadius(3)
                                 .help("旧 IP：\(item.previousIP) → 新 IP：\(item.changedNewIP.isEmpty ? item.ip : item.changedNewIP) · \(item.previousAt > 0 ? Fmt.dateText(item.previousAt) : "时间未知")")
                         }
                     }
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         Text(!item.error.isEmpty ? item.error : item.isGemini ? "等待连接表采集" : "国家 \(item.loc.isEmpty ? "—" : item.loc) · 机房 \(item.colo.isEmpty ? "—" : item.colo)")
-                            .font(.system(size: 8.8)).foregroundColor(item.error.isEmpty ? .secondary : .orange).lineLimit(2)
+                            .font(VG.scaled(8.8)).foregroundColor(item.error.isEmpty ? .secondary : .orange).lineLimit(2)
                             .help(item.error)
                         Spacer(minLength: 0)
                         if !item.isGemini {
-                            Text(item.latencyMS > 0 ? "\(item.latencyMS)ms" : "—").font(.system(size: 8.5)).foregroundColor(.secondary)
-                            if item.capturedAt > 0 { Text(Fmt.ago(max(0, Int(Date().timeIntervalSince1970 - item.capturedAt)))).font(.system(size: 8.5)).foregroundColor(.secondary) }
+                            Text(item.latencyMS > 0 ? "\(item.latencyMS)ms" : "—").font(VG.scaled(8.5)).foregroundColor(.secondary)
+                            if item.capturedAt > 0 { Text(Fmt.ago(max(0, Int(Date().timeIntervalSince1970 - item.capturedAt)))).font(VG.scaled(8.5)).foregroundColor(.secondary) }
                         }
                     }
                 }
             }
-            if traceExits.allSatisfy({ $0.capturedAt == 0 }) { Text("等待后台采集…").font(.system(size: 9)).foregroundColor(.secondary) }
+            if traceExits.allSatisfy({ $0.capturedAt == 0 }) { Text("等待后台采集…").font(VG.scaled(9)).foregroundColor(.secondary) }
         }
     }
 
     private var proxySection: some View {
         VStack(alignment: .leading, spacing: 5) {
             if !snapshot.proxy.error.isEmpty {
-                Text(snapshot.proxy.error).font(.system(size: 9.5)).foregroundColor(.secondary)
+                Text(snapshot.proxy.error).font(VG.scaled(9.5)).foregroundColor(.secondary)
             } else {
                 HStack {
                     Text(snapshot.proxy.running ? "运行中" : "未检测到")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(VG.scaled(10, weight: .medium))
                         .foregroundColor(snapshot.proxy.running ? .green : .secondary)
-                    if !snapshot.proxy.version.isEmpty { Text("· \(snapshot.proxy.version)").font(.system(size: 9)).foregroundColor(.secondary) }
+                    if !snapshot.proxy.version.isEmpty { Text("· \(snapshot.proxy.version)").font(VG.scaled(9)).foregroundColor(.secondary) }
                 }
                 ForEach(snapshot.proxy.groups) { group in
                     HStack(spacing: 5) {
-                        Text(group.name).font(.system(size: 9.5)).lineLimit(1)
-                        Text(group.type).font(.system(size: 8)).foregroundColor(.secondary)
-                        Spacer(); Text(group.now.isEmpty ? "未选择" : group.now).font(.system(size: 9, design: .monospaced)).lineLimit(1)
+                        Text(group.name).font(VG.scaled(9.5)).lineLimit(1)
+                        Text(group.type).font(VG.scaled(8)).foregroundColor(.secondary)
+                        Spacer(); Text(group.now.isEmpty ? "未选择" : group.now).font(VG.scaled(9, design: .monospaced)).lineLimit(1)
                     }
                 }
                 ForEach(snapshot.proxy.connections) { c in
                     if c.count > 0 {
                         HStack(spacing: 5) {
-                            Text(c.name).font(.system(size: 9.5)); Text("\(c.count) 连接").font(.system(size: 9)).foregroundColor(.secondary)
-                            if !c.chains.isEmpty { Text(c.chains.joined(separator: "、")).font(.system(size: 8.5)).foregroundColor(.secondary).lineLimit(1) }
+                            Text(c.name).font(VG.scaled(9.5)); Text("\(c.count) 连接").font(VG.scaled(9)).foregroundColor(.secondary)
+                            if !c.chains.isEmpty { Text(c.chains.joined(separator: "、")).font(VG.scaled(8.5)).foregroundColor(.secondary).lineLimit(1) }
                         }
                         if !c.rules.isEmpty {
-                            Text("规则：" + c.rules.joined(separator: " / ")).font(.system(size: 8)).foregroundColor(.secondary).lineLimit(1)
+                            Text("规则：" + c.rules.joined(separator: " / ")).font(VG.scaled(8)).foregroundColor(.secondary).lineLimit(1)
                         }
                     }
                 }
@@ -152,21 +155,21 @@ public struct NetworkTabView: View {
 
     private func localRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(title).font(.system(size: 9.5, weight: .medium)).frame(width: 52, alignment: .leading)
-            Text(value).font(.system(size: 9)).foregroundColor(.secondary).lineLimit(2).help(value)
+            Text(title).font(VG.scaled(9.5, weight: .medium)).frame(width: 52, alignment: .leading)
+            Text(value).font(VG.scaled(9)).foregroundColor(.secondary).lineLimit(2).help(value)
         }
     }
 
     private var leakSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 5) {
-                Text("IPv6").font(.system(size: 9.5, weight: .medium)).frame(width: 52, alignment: .leading)
+                Text("IPv6").font(VG.scaled(9.5, weight: .medium)).frame(width: 52, alignment: .leading)
                 Text(snapshot.leak.ipv6Message + (snapshot.leak.ipv6Country.isEmpty ? "" : " · \(snapshot.leak.ipv6Country)"))
-                    .font(.system(size: 9)).foregroundColor(snapshot.leak.ipv6Blocked == false ? .orange : .secondary).lineLimit(2)
+                    .font(VG.scaled(9)).foregroundColor(snapshot.leak.ipv6Blocked == false ? .orange : .secondary).lineLimit(2)
             }
             HStack(spacing: 5) {
-                Text("DNS").font(.system(size: 9.5, weight: .medium)).frame(width: 52, alignment: .leading)
-                Text(snapshot.leak.dnsVerdict.rawValue).font(.system(size: 9)).foregroundColor(snapshot.leak.dnsVerdict == .domesticWarning ? .orange : .secondary)
+                Text("DNS").font(VG.scaled(9.5, weight: .medium)).frame(width: 52, alignment: .leading)
+                Text(snapshot.leak.dnsVerdict.rawValue).font(VG.scaled(9)).foregroundColor(snapshot.leak.dnsVerdict == .domesticWarning ? .orange : .secondary)
             }
         }
     }

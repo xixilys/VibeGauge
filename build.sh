@@ -20,12 +20,23 @@ for ARCH in ${ARCHS}; do
         -framework SwiftUI \
         -framework ServiceManagement \
         -framework UserNotifications \
+        -lsqlite3 \
+        Sources/UITheme.swift \
+        Sources/DesignSystem.swift \
+        Sources/PricingCatalog.swift \
+        Sources/PriceSync.swift \
         Sources/ProcessScanner.swift \
         Sources/ProxyManager.swift \
         Sources/NetworkScanner.swift \
         Sources/NetworkTabView.swift \
+        Sources/OpenCodeUsage.swift \
+        Sources/RemoteCollector.swift \
         Sources/UsageHistory.swift \
+        Sources/UsageForecast.swift \
+        Sources/NerfDetector.swift \
         Sources/StatsTabView.swift \
+        Sources/HealthViews.swift \
+        Sources/PricingViews.swift \
         Sources/DashboardView.swift \
         Sources/AppDelegate.swift \
         Sources/main.swift \
@@ -41,6 +52,8 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 mv "${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 cp Resources/Info.plist "${APP_BUNDLE}/Contents/Info.plist"
 cp Resources/vibegauge-proxy.py "${APP_BUNDLE}/Contents/Resources/vibegauge-proxy.py"
+cp Resources/vibegauge-collector.py "${APP_BUNDLE}/Contents/Resources/vibegauge-collector.py"
+cp Resources/prices.builtin.json "${APP_BUNDLE}/Contents/Resources/prices.builtin.json"
 if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 fi

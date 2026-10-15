@@ -218,7 +218,8 @@ public struct APIKeyUsage: Identifiable {
     public var ctx: Int64 = 0
     public var out: Int64 = 0
     public var lastTS: TimeInterval = 0
-    public var cost: Double? = nil
+    /// 按币种分桶（国产 ¥ / 外国 $）；空 = 没价
+    public var cost: [String: Double] = [:]
     public var models: [String] = []
 }
 
@@ -256,9 +257,8 @@ public struct APIProviderStatus: Identifiable {
     public var p95ms: Int = 0
     public var maxms: Int = 0
     public var count429: Int = 0
-    /// nil = 没配价目表，不估（不编价格）
-    public var cost: Double? = nil
-    public var costCurrency: String = ""
+    /// 按币种分桶（国产 ¥ / 外国 $）；空 = 没配价目表或模型没价，不估（不编价格）
+    public var cost: [String: Double] = [:]
     public var keys: [APIKeyUsage] = []
     public var errorRate: Double { calls > 0 ? Double(errors) / Double(calls) * 100.0 : 0.0 }
 }
@@ -306,6 +306,12 @@ public struct DiskItem: Identifiable {
     public var note: String = ""          // 清了会失去什么 / 为什么不清
 }
 
+public struct RemoteDeviceStatus {
+    public var lastSuccess: TimeInterval? = nil
+    public var lastAttempt: TimeInterval? = nil
+    public var error: String = ""
+}
+
 public struct ScanReport {
     // 内存与虚拟内存
     public var freePercentage: Int = 0
@@ -324,6 +330,11 @@ public struct ScanReport {
 
     // 各平台运行时 + 档位 + 额度
     public var detectedLLMs: [DetectedLLMRuntime] = []
+
+    /// 已配置的远程设备（空 = 没有远程），面板顶部「设备」切换器据此显示。
+    public var remoteHosts: [String] = []
+    public var remoteLLMs: [String: [DetectedLLMRuntime]] = [:]
+    public var remoteDeviceStatus: [String: RemoteDeviceStatus] = [:]
 
     public var activeMCPProcessCount: Int = 0
     public var activeMCPTotalMemMB: Double = 0.0
@@ -861,7 +872,10 @@ public final class ProcessScanner {
     // MARK: 全量扫描（8s 定时器）
 
     public func scan(refreshRemote: Bool = true) -> ScanReport {
-        if refreshRemote { refreshRemoteCodexIfDue() }  // 自测只扫描本机，不为验收触发远程 SSH
+        if refreshRemote {
+            RemoteCollector.refreshDiscoveryIfDue()
+            refreshRemoteCodexIfDue()
+        }  // 自测只扫描本机，不为验收触发远程 SSH；历史用量由 UsageHistory 独立采集。
         lock.lock(); defer { lock.unlock() }
         var report = ScanReport()
 
@@ -1007,6 +1021,11 @@ public final class ProcessScanner {
         report.detectedLLMs = withQuotaSamples(detectAllLLMRuntimes(counts))
         report.api = scanAPI()
         report.cliUsage = scanCLIUsage(claude: report.tokens)
+        report.remoteHosts = RemoteCollector.devices()
+        remoteLock.lock()
+        report.remoteLLMs = remoteLLMs.filter { report.remoteHosts.contains($0.key) }
+        report.remoteDeviceStatus = remoteDeviceStatus.filter { report.remoteHosts.contains($0.key) }
+        remoteLock.unlock()
         return report
     }
 
@@ -1153,7 +1172,20 @@ public final class ProcessScanner {
 
     // MARK: 档位（只报数据里真实有的，查不到就说查不到，不猜）
 
+    /// 没额度数据时说清楚原因：走第三方端点（没有订阅额度可读）/ 没装 statusLine 截获 / 等下一轮对话。
+    private func claudeQuotaHint(hasQuota: Bool) -> String {
+        let settings = readJSON("\(home)/.claude/settings.json")
+        let baseURL = ((settings?["env"] as? [String: Any])?["ANTHROPIC_BASE_URL"] as? String) ?? env["ANTHROPIC_BASE_URL"] ?? ""
+        if let host = URL(string: baseURL)?.host, !host.hasSuffix("anthropic.com") {
+            return "走 \(host)，无订阅额度"
+        }
+        if settings?["statusLine"] == nil { return "未配置 statusLine，无额度" }
+        return "等 Claude Code 下一轮对话刷新额度"
+    }
+
     private func getClaudeTier() -> String {
+        let baseURL = ((readJSON("\(home)/.claude/settings.json")?["env"] as? [String: Any])?["ANTHROPIC_BASE_URL"] as? String) ?? env["ANTHROPIC_BASE_URL"] ?? ""
+        if let host = URL(string: baseURL)?.host, !host.hasSuffix("anthropic.com") { return "API" }
         if let oa = readJSON("\(home)/.claude.json")?["oauthAccount"] as? [String: Any] {
             let rate = (oa["organizationRateLimitTier"] as? String ?? "").lowercased()   // e.g. default_claude_max_5x
             if rate.contains("max_20x") { return "Max 20x" }
@@ -1249,6 +1281,11 @@ public final class ProcessScanner {
     /// 目前只有 five_hour / seven_day；若将来出现按模型的窗口键（如 seven_day_fable），自动当副池显示，键名即池名。
     private func readClaudeQuota() -> (fiveHour: QuotaWindow?, sevenDay: QuotaWindow?, extraName: String, extra5h: QuotaWindow?, extraW: QuotaWindow?) {
         guard let json = readJSON("\(home)/.claude/claude-usage.json") else { return (nil, nil, "", nil, nil) }
+        return parseClaudeQuota(json)
+    }
+
+    /// 解析 Claude 额度对象。本机读文件、远程由采集器把同一份原文带回来，两边共用这一份口径。
+    private func parseClaudeQuota(_ json: [String: Any]) -> (fiveHour: QuotaWindow?, sevenDay: QuotaWindow?, extraName: String, extra5h: QuotaWindow?, extraW: QuotaWindow?) {
         let captured = (json["_captured_at"] as? NSNumber)?.doubleValue
         func win(_ d: Any?, _ windowSeconds: Double) -> QuotaWindow? {
             guard let d = d as? [String: Any], let used = clampPct(d["used_percentage"] as? NSNumber) else { return nil }
@@ -1292,13 +1329,28 @@ public final class ProcessScanner {
     private var codexFileCache: [String: (mtime: TimeInterval, parsed: CodexParse)] = [:]
 
     private let remoteLock = NSLock()
-    private var remoteCodex: (at: TimeInterval, ok: Bool, parsed: CodexParse) = (0, false, CodexParse())
-    /// 另一台真正跑 Codex 的机器（默认空 = 关闭远程合并）。
-    /// 开启：`defaults write com.haifeng.vibegauge codexRemoteHost <ssh-host>`，该 host 需能免密 ssh。
-    public var codexRemoteHost: String {
-        let raw = (UserDefaults.standard.string(forKey: "codexRemoteHost") ?? "").trimmingCharacters(in: .whitespaces)
-        return Self.isValidSSHHost(raw) ? raw : ""
-    }
+    private var remoteLLMs: [String: [DetectedLLMRuntime]] = [:]
+    private var remoteDeviceStatus: [String: RemoteDeviceStatus] = [:]
+    private var quotaInFlight = Set<String>()
+    private let quotaQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "VibeGauge.remoteQuotas"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 3
+        return queue
+    }()
+    private let summaryQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "VibeGauge.remoteSummary"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
+    /// 跑 Codex 的远程机器，可配多台（默认空 = 关闭远程合并）。
+    /// 开启：`defaults write com.haifeng.vibegauge remoteHosts "wsl-box gpu-host"`，每台都要能免密 ssh。
+    /// 旧的单机键 `codexRemoteHost` 仍然认。
+    public var codexRemoteHosts: [String] { RemoteCollector.hosts() }
 
     /// 这个值会被拼进 `ssh <host> '...'` 的 shell 命令，所以只放行合法主机名/别名/user@host。
     /// 虽然只有本机用户能写这个 UserDefaults，但拼 shell 就该校验 —— 别给分号和反引号留门。
@@ -1307,9 +1359,100 @@ public final class ProcessScanner {
         return h.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$"#, options: .regularExpression) != nil
     }
 
-    public func codexRemoteStatus() -> (host: String, ok: Bool, ageSeconds: Int) {
+    public func codexRemoteStatus() -> (hosts: [String], ok: Bool, ageSeconds: Int) {
+        let hosts = codexRemoteHosts
         remoteLock.lock(); defer { remoteLock.unlock() }
-        return (codexRemoteHost, remoteCodex.ok, Int(Date().timeIntervalSince1970 - remoteCodex.at))
+        let statuses = hosts.compactMap { remoteDeviceStatus[$0] }
+        let last = statuses.compactMap { $0.lastSuccess }.max()
+        return (hosts, statuses.contains { $0.lastSuccess != nil && $0.error.isEmpty }, last.map { Int(max(0, Date().timeIntervalSince1970 - $0)) } ?? 0)
+    }
+
+    public func codexRemoteHostStatus() -> [(host: String, ok: Bool, ageSeconds: Int)] {
+        let hosts = codexRemoteHosts
+        remoteLock.lock(); defer { remoteLock.unlock() }
+        let now = Date().timeIntervalSince1970
+        return hosts.map { host in
+            let entry = remoteDeviceStatus[host]
+            return (host, entry?.lastSuccess != nil && entry?.error.isEmpty == true,
+                    entry?.lastSuccess.map { Int(max(0, now - $0)) } ?? 0)
+        }
+    }
+
+    // MARK: 远程「今日用量」（采集器 --summary；5 分钟一次）
+
+    /// 一台远程主机已知的额度。没采集到的就是 nil，面板如实显示「未采集」。
+    public struct RemoteQuota {
+        public var codexFiveHour: QuotaWindow?
+        public var codexWeekly: QuotaWindow?
+        public var codexPlan: String = ""
+        public var claudeFiveHour: QuotaWindow?
+        public var claudeWeekly: QuotaWindow?
+    }
+
+    private var remoteSummary: [String: RemoteCollector.Summary] = [:]
+    private var summaryAttempt: [String: TimeInterval] = [:]
+    private var summaryInFlight = Set<String>()
+
+    /// History scans have their own queue and cadence; they never block local or quota refreshes.
+    public func refreshRemoteSummaryIfDue(force: Bool = false) {
+        let now = Date().timeIntervalSince1970
+        for host in codexRemoteHosts {
+            remoteLock.lock()
+            let due = !summaryInFlight.contains(host) && (force || now - (summaryAttempt[host] ?? 0) >= 300)
+            if due { summaryInFlight.insert(host); summaryAttempt[host] = now }
+            remoteLock.unlock()
+            guard due else { continue }
+            summaryQueue.addOperation { [self] in
+                let result = RemoteCollector.pullSummary(host: host)
+                remoteLock.lock()
+                if case .success(let summary) = result { remoteSummary[host] = summary }
+                summaryInFlight.remove(host)
+                remoteLock.unlock()
+            }
+        }
+    }
+
+    /// 每台远程主机今日各 CLI 的用量（给「按设备」视图用）。
+    public func remoteTodayByHost() -> [String: [CLIUsage]] {
+        remoteLock.lock(); let summaries = remoteSummary; remoteLock.unlock()
+        var out: [String: [CLIUsage]] = [:]
+        for (host, summary) in summaries {
+            var rows: [CLIUsage] = []
+            for key in ["opencode", "codex", "claude"] {
+                guard let today = summary.today[key] else { continue }
+                var usage = CLIUsage(name: Self.cliLabel(key))
+                usage.ctx = today.ctx; usage.cacheRead = today.cacheRead
+                usage.out = today.out; usage.think = today.think
+                usage.requests = today.requests; usage.turns = today.requests
+                rows.append(usage)
+            }
+            out[host] = rows
+        }
+        return out
+    }
+
+    /// Compatibility view for existing per-device cards; never merges accounts across hosts.
+    public func remoteQuotaByHost() -> [String: RemoteQuota] {
+        let hosts = codexRemoteHosts
+        remoteLock.lock(); let snapshots = remoteLLMs; remoteLock.unlock()
+        var out: [String: RemoteQuota] = [:]
+        for host in hosts {
+            let rows = snapshots[host] ?? []
+            let codex = rows.first { $0.name == "Codex" }
+            let claude = rows.first { $0.name == "Claude" }
+            out[host] = RemoteQuota(codexFiveHour: codex?.fiveHour, codexWeekly: codex?.sevenDay,
+                                    codexPlan: codex?.tier ?? "", claudeFiveHour: claude?.fiveHour, claudeWeekly: claude?.sevenDay)
+        }
+        return out
+    }
+
+    static func cliLabel(_ key: String) -> String {
+        switch key {
+        case "opencode": return "opencode"
+        case "codex": return "Codex"
+        case "claude": return "Claude Code"
+        default: return key
+        }
     }
 
     private func findRateLimits(_ x: Any) -> [String: Any]? {
@@ -1411,40 +1554,63 @@ public final class ProcessScanner {
         return merged
     }
 
-    /// 远程主机（`codexRemoteHost`，默认关闭）：ssh 拉 48h 内会话文件各自最后一条额度行。
-    /// 60s 节流；失败保留上次结果；不持扫描锁。
+    /// Cheap quota-only requests run concurrently; each host retains its own last successful snapshot.
     public func refreshRemoteCodexIfDue(force: Bool = false) {
-        let host = codexRemoteHost
-        guard !host.isEmpty else { return }
         let now = Date().timeIntervalSince1970
-        remoteLock.lock()
-        let due = force || now - remoteCodex.at >= 60
-        remoteLock.unlock()
-        guard due else { return }
-        // 每个文件取：最后一条含百分比的行 + 最后一条额度耗尽事件
-        let script = #"for f in $(find ~/.codex/sessions -name "*.jsonl" -mmin -2880 2>/dev/null); do tail -c 262144 "$f" | grep used_percent | tail -1; tail -c 262144 "$f" | grep usage_limit_exceeded | tail -1; done; echo __OK__"#
-        let out = execute("ssh -o BatchMode=yes -o ConnectTimeout=4 -o ServerAliveInterval=5 -- \(host) '\(script)' 2>/dev/null")
-        let ok = out.contains("__OK__")
-        let parsed = ok ? parseCodexText(out, fallbackTime: now) : CodexParse()
-        remoteLock.lock()
-        remoteCodex = ok ? (now, true, parsed) : (now, false, remoteCodex.parsed)
-        remoteLock.unlock()
-        log.notice("remote codex \(host) ok=\(ok) buckets=\(parsed.buckets.count) limitHit=\(parsed.limitHit != nil)")
+        for host in codexRemoteHosts {
+            remoteLock.lock()
+            let status = remoteDeviceStatus[host] ?? RemoteDeviceStatus()
+            let due = !quotaInFlight.contains(host) && (force || now - (status.lastAttempt ?? 0) >= 60)
+            if due {
+                quotaInFlight.insert(host)
+                var updated = status
+                updated.lastAttempt = now
+                remoteDeviceStatus[host] = updated
+            }
+            remoteLock.unlock()
+            guard due else { continue }
+            quotaQueue.addOperation { [self] in
+                let result = RemoteCollector.pullQuotas(host: host)
+                remoteLock.lock()
+                var status = remoteDeviceStatus[host] ?? RemoteDeviceStatus()
+                switch result {
+                case .failure(let error): status.error = error.message
+                case .success(let rows):
+                    remoteLLMs[host] = Self.retainingMissingQuotas(rows, previous: remoteLLMs[host] ?? [])
+                    status.lastSuccess = Date().timeIntervalSince1970
+                    status.error = ""
+                }
+                remoteDeviceStatus[host] = status
+                quotaInFlight.remove(host)
+                remoteLock.unlock()
+            }
+        }
+    }
+
+    static func retainingMissingQuotas(_ rows: [DetectedLLMRuntime], previous: [DetectedLLMRuntime]) -> [DetectedLLMRuntime] {
+        var readings = rows
+        for old in previous where !rows.contains(where: { $0.name == old.name }) {
+            readings.append(DetectedLLMRuntime(name: old.name, isRunning: false, tier: "", detail: L("会话数未知", "Sessions unknown")))
+        }
+        return readings.map { row in
+            guard !row.hasQuota, let last = previous.first(where: { $0.name == row.name && $0.hasQuota }) else { return row }
+            var retained = row
+            retained.fiveHour = last.fiveHour; retained.sevenDay = last.sevenDay
+            retained.secondaryFiveHour = last.secondaryFiveHour; retained.secondarySevenDay = last.secondarySevenDay
+            retained.secondaryPoolName = last.secondaryPoolName
+            retained.quotaNote = L("未取得新额度，保留上次读数", "Quota missing; showing last reading")
+            return retained
+        }
     }
 
     private struct CodexSnapshot {
         var primary: CodexBucket?
         var plan: String
-        var remoteOK: Bool
     }
 
     /// 只展示主桶 "codex"；其他桶（如 codex_bengalfox / Spark）解析出来只为了不被误当主桶，不显示
     private func codexSnapshot() -> CodexSnapshot {
-        var merged = readLocalCodex()
-        remoteLock.lock()
-        let remote = remoteCodex
-        remoteLock.unlock()
-        mergeNewest(&merged, remote.parsed)
+        let merged = readLocalCodex()
         let plan = merged.buckets.values.sorted { $0.captured > $1.captured }.first { !$0.plan.isEmpty }?.plan ?? ""
         var primary = merged.buckets["codex"]
 
@@ -1463,7 +1629,7 @@ public final class ProcessScanner {
                 }
             }
         }
-        return CodexSnapshot(primary: primary, plan: plan, remoteOK: remote.ok)
+        return CodexSnapshot(primary: primary, plan: plan)
     }
 
     /// Grok：grok CLI 自己在 ~/.grok/logs/unified.jsonl 记 "billing: fetched credits config"
@@ -1580,10 +1746,6 @@ public final class ProcessScanner {
             }
             if let mode = auth["auth_mode"] as? String { d.rows.append(("鉴权方式", mode)) }
         }
-        if !codexRemoteHost.isEmpty {
-            remoteLock.lock(); let ok = remoteCodex.ok; let at = remoteCodex.at; remoteLock.unlock()
-            d.rows.append(("远程合并主机", "\(codexRemoteHost) · " + (ok ? "已连上（\(Fmt.agoShort(Int(Date().timeIntervalSince1970 - at))) 拉取）" : "未连上")))
-        }
         for (id, b) in buckets.sorted(by: { $0.key < $1.key }) where id != "codex" {
             let label = b.name.isEmpty ? id : b.name
             if let w = b.weekly { d.extraPools.append(("\(label) 周", w)) }
@@ -1635,25 +1797,22 @@ public final class ProcessScanner {
                 fiveHour: q.fiveHour, sevenDay: q.sevenDay,
                 secondaryPoolName: q.extraName, secondaryFiveHour: q.extra5h, secondarySevenDay: q.extraW,
                 isFullWidth: !q.extraName.isEmpty,
-                quotaSubtitle: "Anthropic · 无额度数据 (状态栏未截获)",
+                quotaSubtitle: claudeQuotaHint(hasQuota: q.fiveHour != nil || q.sevenDay != nil),
                 platformDetail: claudeDetail(c)
             ))
         }
 
-        // Codex（本机 + 远程合并；只显示主桶 codex）
+        // Codex（只读本机；远程按设备独立展示）
         if c.codex > 0 || fm.fileExists(atPath: "\(home)/.codex/auth.json") {
             let q = codexSnapshot()
-            var allBuckets = readLocalCodex().buckets
-            remoteLock.lock(); let rb = remoteCodex.parsed.buckets; remoteLock.unlock()
-            for (k, v) in rb where v.captured > (allBuckets[k]?.captured ?? -1) { allBuckets[k] = v }
-            let hasRemote = !codexRemoteHost.isEmpty
+            let allBuckets = readLocalCodex().buckets
             list.append(DetectedLLMRuntime(
                 name: "Codex",
                 isRunning: c.codex > 0,
                 tier: getCodexTier(sessionPlan: q.plan),
                 detail: "\(c.codex) 会话",
                 fiveHour: q.primary?.fiveHour, sevenDay: q.primary?.weekly,
-                quotaSubtitle: (hasRemote && !q.remoteOK) ? "OpenAI · 无额度数据 (\(codexRemoteHost) 未连上)" : "OpenAI · 无额度数据 (近两日无 session)",
+                quotaSubtitle: L("OpenAI · 未采集到本机额度", "OpenAI · Local quota unavailable"),
                 platformDetail: codexDetail(c, snapshot: q, buckets: allBuckets)
             ))
         }
@@ -1743,7 +1902,7 @@ public final class ProcessScanner {
               let msg = json["message"] as? [String: Any],
               let usage = msg["usage"] as? [String: Any] else { return nil }
         let model = msg["model"] as? String ?? ""
-        if model.contains("synthetic") { return nil }
+        if model.contains("synthetic") || json["isApiErrorMessage"] as? Bool == true { return nil }
         let id = (json["requestId"] as? String) ?? (msg["id"] as? String) ?? (json["uuid"] as? String) ?? UUID().uuidString
         let inp = usage["input_tokens"] as? Int ?? 0
         let cRead = usage["cache_read_input_tokens"] as? Int ?? 0
@@ -1776,7 +1935,9 @@ public final class ProcessScanner {
             for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 if var rec = parseAssistantLine(line) {
                     if rec.timestamp == 0 { rec.timestamp = mtime }
-                    state.turns[rec.id] = rec   // 同 requestId 后写覆盖前写（usage 相同）
+                    // 同 requestId 流式分块会写多行，取 token 最多的那条（与历史统计口径一致）
+                    if let old = state.turns[rec.id], old.contextTokens + old.outputTokens > rec.contextTokens + rec.outputTokens { continue }
+                    state.turns[rec.id] = rec
                 }
             }
             state.parsedOffset += UInt64(chunk.count)
@@ -1790,30 +1951,28 @@ public final class ProcessScanner {
     public func scanTokens() -> TokenStats {
         lock.lock(); defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
-        let projectsDir = "\(home)/.claude/projects"
         let fm = FileManager.default
-        guard let en = fm.enumerator(atPath: projectsDir) else {
-            fileStates = [:]
-            return TokenStats()
-        }
-
         let horizon = now - 24.0 * 3600.0
         var seen = Set<String>()
         var byId: [String: InteractionRecord] = [:]   // 跨文件再去重（--fork-session 会把历史复制进新文件）
         var idPath: [String: String] = [:]            // 这轮最终算在哪个文件上 → 用来归因到项目目录
-        while let el = en.nextObject() as? String {
-            guard el.hasSuffix(".jsonl") else { continue }
-            let path = "\(projectsDir)/\(el)"
-            guard let attrs = try? fm.attributesOfItem(atPath: path),
-                  let mod = attrs[.modificationDate] as? Date else { continue }
-            let mtime = mod.timeIntervalSince1970
-            guard mtime > horizon else { continue }
-            let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-            seen.insert(path)
-            for (id, rec) in refreshFileState(path: path, mtime: mtime, size: size).turns {
-                if let old = byId[id], old.timestamp >= rec.timestamp { continue }
-                byId[id] = rec
-                idPath[id] = path
+        // Claude Code 新版默认写 ~/.config/claude/projects，老版本写 ~/.claude/projects：两处都读
+        for projectsDir in ["\(home)/.claude/projects", "\(home)/.config/claude/projects"] {
+            guard let en = fm.enumerator(atPath: projectsDir) else { continue }
+            while let el = en.nextObject() as? String {
+                guard el.hasSuffix(".jsonl") else { continue }
+                let path = "\(projectsDir)/\(el)"
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mod = attrs[.modificationDate] as? Date else { continue }
+                let mtime = mod.timeIntervalSince1970
+                guard mtime > horizon else { continue }
+                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+                seen.insert(path)
+                for (id, rec) in refreshFileState(path: path, mtime: mtime, size: size).turns {
+                    if let old = byId[id], old.contextTokens + old.outputTokens >= rec.contextTokens + rec.outputTokens { continue }
+                    byId[id] = rec
+                    idPath[id] = path
+                }
             }
         }
         fileStates = fileStates.filter { seen.contains($0.key) }
@@ -1847,99 +2006,140 @@ public final class ProcessScanner {
         return s
     }
 
-    /// Codex 的今日用量按会话文件的 cwd 归并。口径与 codexUsageToday 一致：
-    /// `total_token_usage` 是**该会话累计**，每个文件取最后一条非空的再相加。
+    /// Codex 的今日用量按会话文件的 cwd 归并。口径与 codexUsageToday 一致（逐请求、按时间戳算今天）。
     private func mergeCodexProjects(into byProject: inout [String: ProjectUsage], startOfToday: TimeInterval) {
-        let fm = FileManager.default
-        let df = DateFormatter()
-        df.dateFormat = "yyyy/MM/dd"
-        for back in 0...1 {
-            let dir = "\(home)/.codex/sessions/\(df.string(from: Date(timeIntervalSinceNow: -Double(back) * 86400)))"
-            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for n in names where n.hasSuffix(".jsonl") {
-                let path = "\(dir)/\(n)"
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mod = attrs[.modificationDate] as? Date,
-                      mod.timeIntervalSince1970 >= startOfToday,
-                      let cwd = sessionCwd(of: path),
-                      let u = codexFileUsage(path: path) else { continue }
-                var p = byProject[cwd] ?? ProjectUsage(path: cwd)
-                p.turns += u.requests
-                p.ctx += u.ctx
-                p.out += u.out
-                p.think += u.think
-                if !p.clis.contains("Codex") { p.clis.append("Codex") }
-                byProject[cwd] = p
-            }
+        for path in codexHotFiles(startOfToday: startOfToday) {
+            guard let cwd = sessionCwd(of: path), let u = codexFileUsage(path: path), u.requests > 0 else { continue }
+            var p = byProject[cwd] ?? ProjectUsage(path: cwd)
+            p.turns += u.requests
+            p.ctx += u.ctx
+            p.out += u.out
+            p.think += u.think
+            if !p.clis.contains("Codex") { p.clis.append("Codex") }
+            byProject[cwd] = p
         }
     }
 
     // MARK: 各 CLI 今日用量
 
-    private var codexUsageCache: [String: (mtime: TimeInterval, usage: CLIUsage)] = [:]
+    /// 单个 Codex 会话文件「今天」的增量解析状态。跨零点整体重来一次（只读今天的请求）。
+    private struct CodexTodayState {
+        var day = ""
+        var offset: UInt64 = 0
+        var model = "?"
+        var tier: String? = nil
+        var previousTotal: [String: Int64]? = nil
+        var hasUsageRecords = false
+        var usage = CLIUsage(name: "Codex")
+    }
+    private var codexToday: [String: CodexTodayState] = [:]
+    private var codexFileList: (at: TimeInterval, files: [(path: String, mtime: TimeInterval)]) = (0, [])
 
-    /// Codex：`token_count` 事件的 `info.total_token_usage` 是**该会话的累计值** → 每个会话文件取最后一条非空的，再跨文件相加。
-    /// 跨零点的会话会把昨天那部分也算进来（Codex 不按天分账，只能这样近似）。
+    /// 今天动过的 Codex 会话文件。按「开始日期」分目录，老会话今天还在跑也要算上 → 全量列目录，60 秒缓存一次。
+    private func codexHotFiles(startOfToday: TimeInterval) -> [String] {
+        let now = Date().timeIntervalSince1970
+        if now - codexFileList.at > 60 {
+            var files: [(String, TimeInterval)] = []
+            let root = URL(fileURLWithPath: "\(home)/.codex/sessions")
+            if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
+                for case let url as URL in en where url.pathExtension == "jsonl" {
+                    let mt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                    files.append((url.path, mt))
+                }
+            }
+            codexFileList = (now, files)
+        }
+        // 60 秒内新建的会话由下一次列目录补上；已知文件每次重新取 mtime（只 stat 近两天动过的）
+        return codexFileList.files.compactMap { item in
+            guard item.mtime >= startOfToday - 86400 else { return nil }
+            let mt = ((try? FileManager.default.attributesOfItem(atPath: item.path))?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            return mt >= startOfToday ? item.path : nil
+        }
+    }
+
+    /// Codex 今天：逐请求累加时间戳落在今天的用量（token_usage_record 优先，旧版用 token_count 的 last_token_usage）。
+    /// 旧实现取每个会话的累计值，跨零点的长会话会把前几天也算进今天。
     private func codexUsageToday(startOfToday: TimeInterval) -> CLIUsage {
         var u = CLIUsage(name: "Codex")
-        let fm = FileManager.default
-        let df = DateFormatter()
-        df.dateFormat = "yyyy/MM/dd"
-        var seen = Set<String>()
-        for back in 0...1 {
-            let dir = "\(home)/.codex/sessions/\(df.string(from: Date(timeIntervalSinceNow: -Double(back) * 86400)))"
-            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for n in names where n.hasSuffix(".jsonl") {
-                let path = "\(dir)/\(n)"
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mod = attrs[.modificationDate] as? Date else { continue }
-                let mtime = mod.timeIntervalSince1970
-                guard mtime >= startOfToday else { continue }
-                seen.insert(path)
-                guard let one = codexFileUsage(path: path, mtime: mtime) else { continue }
-                u.ctx += one.ctx
-                u.cacheRead += one.cacheRead
-                u.out += one.out
-                u.think += one.think
-                u.requests += one.requests
-            }
+        let hot = codexHotFiles(startOfToday: startOfToday)
+        for path in hot {
+            guard let one = codexFileUsage(path: path) else { continue }
+            u.ctx += one.ctx
+            u.cacheRead += one.cacheRead
+            u.out += one.out
+            u.think += one.think
+            u.requests += one.requests
         }
-        codexUsageCache = codexUsageCache.filter { seen.contains($0.key) }
+        let keep = Set(hot)
+        codexToday = codexToday.filter { keep.contains($0.key) }
         if !u.hasTokens { u.note = "今日无调用" }
         return u
     }
 
-    /// 单个 Codex 会话文件的累计用量（`total_token_usage` 是该会话累计 → 取最后一条非空的）。
-    /// 按 CLI 汇总与按项目归因共用这一份，口径不会分叉。
-    private func codexFileUsage(path: String, mtime: TimeInterval? = nil) -> CLIUsage? {
-        let mt = mtime ?? ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date)?.timeIntervalSince1970
-        guard let mt = mt else { return nil }
-        if let c = codexUsageCache[path], c.mtime == mt { return c.usage }
-        var acc = CLIUsage(name: "Codex")
-        let text = readTail(path, maxBytes: 256 * 1024)
-        let lines = text.components(separatedBy: "\n")
-        for l in lines.reversed() where l.contains("\"type\":\"token_count\"") && !l.contains("\"info\":null") {
-            guard let data = l.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let info = findTokenInfo(json),
-                  let t = info["total_token_usage"] as? [String: Any] else { continue }
-            func n64(_ k: String) -> Int64 { Int64((t[k] as? NSNumber)?.intValue ?? 0) }
-            acc.ctx = n64("input_tokens")               // 已含 cached
-            acc.cacheRead = n64("cached_input_tokens")
-            acc.out = n64("output_tokens")
-            acc.think = n64("reasoning_output_tokens")
-            break
+    /// 从文件尾部按 4MB 往回跳，找到第一个时间戳早于 `start` 的行首；rollout 每行以 {"timestamp":"…"} 开头且按时间追加。
+    static func codexSeekToDay(_ fh: FileHandle, size: UInt64, start: TimeInterval) -> UInt64 {
+        let step: UInt64 = 4 << 20
+        var pos = size
+        while pos > 0 {
+            let from = pos > step ? pos - step : 0
+            guard (try? fh.seek(toOffset: from)) != nil, let data = try? fh.read(upToCount: 4096), !data.isEmpty else { return 0 }
+            // 跳过半行，取下一行的时间戳
+            var lineStart = data.startIndex
+            if from > 0 { guard let nl = data.firstIndex(of: 0x0A) else { pos = from; continue }; lineStart = data.index(after: nl) }
+            let head = String(decoding: data[lineStart...].prefix(80), as: UTF8.self)
+            if let r = head.range(of: #"\d{4}-\d{2}-\d{2}T[0-9:.]+Z"#, options: .regularExpression),
+               let t = Fmt.parseISODate(String(head[r])), t < start {
+                return from + UInt64(data.distance(from: data.startIndex, to: lineStart))
+            }
+            if from == 0 { return 0 }
+            pos = from
         }
-        acc.requests = lines.filter { $0.contains("\"type\":\"token_count\"") && !$0.contains("\"info\":null") }.count
-        codexUsageCache[path] = (mt, acc)
-        return acc
+        return 0
     }
 
-    private func findTokenInfo(_ x: Any) -> [String: Any]? {
-        guard let d = x as? [String: Any] else { return nil }
-        if d["total_token_usage"] != nil { return d }
-        for v in d.values { if let r = findTokenInfo(v) { return r } }
-        return nil
+    /// 单个 Codex 会话文件今天的用量（增量读，只解析新追加的完整行）。按 CLI 汇总与按项目归因共用这一份。
+    private func codexFileUsage(path: String, mtime: TimeInterval? = nil) -> CLIUsage? {
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let day = UsageHistory.dayKey(timestamp: startOfToday + 1)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value else { return nil }
+        var st = codexToday[path] ?? CodexTodayState()
+        var fresh = false
+        if st.day != day || size < st.offset { st = CodexTodayState(); st.day = day; fresh = true }
+        guard size > st.offset, let fh = FileHandle(forReadingAtPath: path) else { codexToday[path] = st; return st.usage }
+        defer { try? fh.close() }
+        // 第一次读（或跨零点）：长会话文件动辄几百 MB，从尾部往回跳到「今天之前」的那一行再开始，别整文件扫
+        if fresh, size > 8 << 20 { st.offset = Self.codexSeekToDay(fh, size: size, start: startOfToday) }
+        do { try fh.seek(toOffset: st.offset) } catch { return st.usage }
+        let data = fh.readDataToEndOfFile()
+        guard let lastNL = data.lastIndex(of: 0x0A) else { codexToday[path] = st; return st.usage }
+        let chunk = data[data.startIndex...lastNL]
+        let markers = ["\"token_count\"", "\"turn_context\"", "\"token_usage_record\"", "\"thread_settings_applied\""].map { Data($0.utf8) }
+        for line in chunk.split(separator: 0x0A) {
+            guard markers.contains(where: { line.range(of: $0) != nil }),
+                  let j = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                  let payload = j["payload"] as? [String: Any] else { continue }
+            let type = j["type"] as? String ?? ""
+            let ts = parseISO(j["timestamp"] as? String) ?? 0
+            func add(_ m: UsageHistory.ModelTotals) {
+                st.usage.ctx += m.ctx; st.usage.cacheRead += m.cacheRead
+                st.usage.out += m.out; st.usage.think += m.think; st.usage.requests += 1
+            }
+            if type == "turn_context" {
+                if let model = payload["model"] as? String, !model.isEmpty { st.model = model }
+            } else if type == "token_usage_record" {
+                if !st.hasUsageRecords { st.hasUsageRecords = true; st.usage = CLIUsage(name: "Codex") }
+                guard ts >= startOfToday, let fields = UsageHistory.tokenFields(payload["usage"]) else { continue }
+                add(UsageHistory.codexLastTokenUsage(fields))
+            } else if type == "event_msg", payload["type"] as? String == "token_count", let info = payload["info"] as? [String: Any] {
+                guard let parsed = UsageHistory.codexUsage(info: info, previous: &st.previousTotal),
+                      !st.hasUsageRecords, ts >= startOfToday else { continue }
+                add(parsed.usage)
+            }
+        }
+        st.offset += UInt64(chunk.count)
+        codexToday[path] = st
+        return st.usage
     }
 
     /// Grok：`signals.json` 只有 `turnCount` 与当前上下文占用，没有累计 token
@@ -2008,8 +2208,40 @@ public final class ProcessScanner {
     /// ```
     /// 没这文件就不估花费 —— 价格会变，编一个假的比不显示更糟。模型名取「最长前缀命中」。
     public struct PriceTable {
-        public struct Row { public var input = 0.0, cacheRead = 0.0, cacheWrite = 0.0, output = 0.0 }
+        /// 一套单价（峰时或闲时各一套）。
+        public struct Rate {
+            public var input = 0.0, cacheRead = 0.0, cacheWrite = 0.0, output = 0.0
+            var isEmpty: Bool { input == 0 && output == 0 && cacheRead == 0 && cacheWrite == 0 }
+        }
+        public struct Row {
+            public var peak: Rate
+            /// 配了闲时价就按记录时间二选一（DeepSeek 那种峰谷定价）；没配则恒用 peak。
+            public var offpeak: Rate?
+            public var currency = ""
+            /// 自定义单价的 Fast 倍率；未配置时保留原来的最终价。
+            public var fastMultiplier = 1.0
+        }
+        /// 峰时窗口：表里配的时区 + 若干 HH:MM-HH:MM 段（分钟数）。没配就视为全天同价。
+        public struct PeakSpec {
+            public var timeZone: TimeZone = .current
+            public var windows: [(start: Int, end: Int)] = []
+            /// Calendar weekday：1=周日，2=周一…7=周六；空集合沿用每日窗口。
+            public var weekdays: Set<Int> = []
+            public var excludedDates: Set<String> = []
+            func isPeak(_ date: Date) -> Bool {
+                guard !windows.isEmpty else { return true }
+                var cal = Calendar(identifier: .gregorian)
+                cal.timeZone = timeZone
+                let parts = cal.dateComponents([.year, .month, .day, .weekday, .hour, .minute], from: date)
+                if !weekdays.isEmpty, !weekdays.contains(parts.weekday ?? 0) { return false }
+                let key = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+                if excludedDates.contains(key) { return false }
+                let minutes = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+                return windows.contains { minutes >= $0.start && minutes < $0.end }
+            }
+        }
         public var rows: [String: Row] = [:]
+        public var peak = PeakSpec()
         public var currency: String = ""
         public var asOf: String = ""
         public var isEmpty: Bool { rows.isEmpty }
@@ -2018,17 +2250,52 @@ public final class ProcessScanner {
         public init(json: [String: Any]) {
             currency = (json["_currency"] as? String) ?? "USD"
             asOf = (json["_asof"] as? String) ?? ""
+            if let p = json["_peak"] as? [String: Any] {
+                if let tzid = p["tz"] as? String, let tz = TimeZone(identifier: tzid) { peak.timeZone = tz }
+                peak.weekdays = Set(((p["weekdays"] as? [Int]) ?? []).filter { (1...7).contains($0) })
+                peak.excludedDates = Set(((p["excluded_dates"] as? [String]) ?? []).filter {
+                    $0.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
+                })
+                for text in (p["windows"] as? [String]) ?? [] {
+                    let ends = text.split(separator: "-")
+                    if ends.count == 2, let start = Self.minutes(String(ends[0])), let end = Self.minutes(String(ends[1])) {
+                        peak.windows.append((start, end))
+                    }
+                }
+            }
             for (k, v) in json where !k.hasPrefix("_") {
                 guard let d = v as? [String: Any] else { continue }
-                func f(_ key: String) -> Double { (d[key] as? NSNumber)?.doubleValue ?? 0 }
-                var r = Row()
-                r.input = f("in"); r.output = f("out")
-                r.cacheRead = d["cache_read"] == nil ? r.input : f("cache_read")
-                r.cacheWrite = d["cache_write"] == nil ? r.input : f("cache_write")
+                func f(_ source: [String: Any], _ key: String) -> Double { (source[key] as? NSNumber)?.doubleValue ?? 0 }
+                func rate(_ source: [String: Any]) -> Rate {
+                    var r = Rate()
+                    r.input = f(source, "in"); r.output = f(source, "out")
+                    r.cacheRead = source["cache_read"] == nil ? r.input : f(source, "cache_read")
+                    r.cacheWrite = source["cache_write"] == nil ? r.input : f(source, "cache_write")
+                    return r
+                }
+                var r = Row(peak: rate(d), offpeak: nil)
+                if let multiplier = d["fast_multiplier"] as? NSNumber,
+                   CFGetTypeID(multiplier) != CFBooleanGetTypeID(),
+                   multiplier.doubleValue.isFinite, multiplier.doubleValue >= 1 {
+                    r.fastMultiplier = multiplier.doubleValue
+                }
+                // 行内币种覆盖表级默认：国产模型填 CNY、外国模型填 USD，留空则用 _currency
+                r.currency = (d["currency"] as? String) ?? currency
+                if let off = d["offpeak"] as? [String: Any] {
+                    let o = rate(off)
+                    if !o.isEmpty { r.offpeak = o }
+                }
                 // 全 0 视为"没填价"（示例文件里的占位行不该算出 ¥0.00 的假花费）
-                if r.input == 0, r.output == 0, r.cacheRead == 0, r.cacheWrite == 0 { continue }
+                if r.peak.isEmpty, r.offpeak == nil { continue }
                 rows[k.lowercased()] = r
             }
+        }
+
+        /// "09:00" → 540（当天第几分钟）。
+        static func minutes(_ hhmm: String) -> Int? {
+            let hm = hhmm.split(separator: ":")
+            guard hm.count == 2, let h = Int(hm[0]), let m = Int(hm[1]), (0..<24).contains(h), (0..<60).contains(m) else { return nil }
+            return h * 60 + m
         }
 
         func row(for model: String) -> Row? {
@@ -2038,12 +2305,20 @@ public final class ProcessScanner {
             return rows.filter { m.hasPrefix($0.key) }.max { $0.key.count < $1.key.count }?.value
         }
 
-        /// ctx 是「全部输入」（新鲜 + 缓存读 + 缓存写），算价时要先把缓存部分扣出来
-        public func cost(model: String, ctx: Int64, cacheRead: Int64, cacheWrite: Int64, out: Int64) -> Double? {
+        /// 该模型计价用的币种；命中不了就退回表级默认。
+        public func currency(for model: String) -> String {
+            row(for: model)?.currency ?? currency
+        }
+
+        /// ctx 是「全部输入」（新鲜 + 缓存读 + 缓存写），算价时要先把缓存部分扣出来。
+        /// 传 `at` 才能吃到峰谷价：没配 `_peak`/`offpeak` 的模型恒用峰时价，结果和以前一样。
+        public func cost(model: String, ctx: Int64, cacheRead: Int64, cacheWrite: Int64, out: Int64, at: Date? = nil, tier: String? = nil) -> Double? {
             guard let r = row(for: model) else { return nil }
+            let rate = (at.map { !peak.isPeak($0) } ?? false) ? (r.offpeak ?? r.peak) : r.peak
             let fresh = max(0, ctx - cacheRead - cacheWrite)
-            return (Double(fresh) * r.input + Double(cacheRead) * r.cacheRead
-                    + Double(cacheWrite) * r.cacheWrite + Double(out) * r.output) / 1_000_000.0
+            let fast = ["priority", "fast"].contains((tier ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            return (Double(fresh) * rate.input + Double(cacheRead) * rate.cacheRead
+                    + Double(cacheWrite) * rate.cacheWrite + Double(out) * rate.output) / 1_000_000.0 * (fast ? r.fastMultiplier : 1)
         }
     }
 
@@ -2370,6 +2645,7 @@ public final class ProcessScanner {
         ingestAPICalls()
         let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
         let prices = priceTable()
+        let engine = CostEngine(user: prices)
         var byHost: [String: APIProviderStatus] = [:]
         var latency: [String: [Int]] = [:]              // host → 今日各次耗时（算 p50/p95）
         var byKey: [String: [String: APIKeyUsage]] = [:]  // host → 指纹 → 用量
@@ -2386,8 +2662,10 @@ public final class ProcessScanner {
             p.lastTS = max(p.lastTS, c.ts)
             if !p.models.contains(c.model) { p.models.append(c.model) }
 
-            let cost = prices.cost(model: c.model, ctx: c.ctx, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, out: c.out)
-            if let cost = cost { p.cost = (p.cost ?? 0) + cost }
+            // 用户价目表优先，Claude / OpenAI 官方模型没配也按内置价估
+            let priced = engine.cost(model: c.model, ctx: c.ctx, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, out: c.out,
+                                     at: Date(timeIntervalSince1970: c.ts))
+            if let priced { p.cost[priced.currency, default: 0] += priced.value }
             byHost[c.host] = p
 
             if c.ms > 0 { latency[c.host, default: []].append(c.ms) }
@@ -2399,7 +2677,7 @@ public final class ProcessScanner {
             k.ctx += c.ctx
             k.out += c.out
             k.lastTS = max(k.lastTS, c.ts)
-            if let cost = cost { k.cost = (k.cost ?? 0) + cost }
+            if let priced { k.cost[priced.currency, default: 0] += priced.value }
             if !k.models.contains(c.model) { k.models.append(c.model) }
             byKey[c.host, default: [:]][fp] = k
         }
@@ -2423,7 +2701,6 @@ public final class ProcessScanner {
         }
         for (host, keys) in byKey {
             byHost[host]?.keys = keys.values.sorted { $0.calls > $1.calls }
-            byHost[host]?.costCurrency = prices.currency
         }
 
         // 订阅制 Coding Plan：厂商不给用量接口 → 按本机记账的请求数估。滚动窗口，标明是估算。

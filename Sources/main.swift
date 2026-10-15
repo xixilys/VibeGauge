@@ -1,4 +1,6 @@
 import Cocoa
+import SwiftUI
+import SQLite3
 
 // `VibeGauge --install-proxy` / `--uninstall-proxy`：命令行装卸 API 记账代理（与菜单同一条代码路径）
 if CommandLine.arguments.contains("--install-proxy") {
@@ -17,8 +19,168 @@ if CommandLine.arguments.contains("--uninstall-proxy") {
     exit(0)
 }
 
+// `VibeGauge --sync-prices`：补齐缺价并刷新未被手改的自动价，保留内置完整计价规则。
+if CommandLine.arguments.contains("--sync-prices") {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let outcome = PriceSync.sync(home: home)
+    if !outcome.error.isEmpty { print(outcome.error) }
+    print("新增 \(outcome.added.count) 个：" + (outcome.added.isEmpty ? "—" : outcome.added.joined(separator: ", ")))
+    print("更新 \(outcome.updated.count) 个：" + (outcome.updated.isEmpty ? "—" : outcome.updated.joined(separator: ", ")))
+    print("社区库里也没有 \(outcome.skipped.count) 个：" + (outcome.skipped.isEmpty ? "—" : outcome.skipped.joined(separator: ", ")))
+    print("价目表：\(PriceSync.pricesPath(home: home))")
+    if !outcome.backupPath.isEmpty { print("备份：\(outcome.backupPath)") }
+    exit(outcome.error.isEmpty ? 0 : 1)
+}
+
+// Read-only diagnostics wait for discovery explicitly; normal UI readers use the cache.
+if CommandLine.arguments.contains("--debug-devices") || CommandLine.arguments.contains("--debug-remote") {
+    let discovery = DispatchSemaphore(value: 0)
+    RemoteCollector.refreshDiscoveryIfDue(force: true) { discovery.signal() }
+    _ = discovery.wait(timeout: .now() + 6)
+}
+
+// `VibeGauge --debug-devices`: quota snapshots only, without transcript/history scans or credentials.
+if CommandLine.arguments.contains("--debug-devices") {
+    let hosts = RemoteCollector.hosts()
+    print("Remote devices: \(hosts.count)")
+    for host in hosts {
+        print("\(RemoteCollector.displayName(for: host)) [\(host)]")
+        switch RemoteCollector.pullQuotas(host: host) {
+        case .failure(let error): print("  error: \(error.message)")
+        case .success(let rows):
+            for row in rows {
+                func window(_ value: QuotaWindow?) -> String {
+                    guard let value else { return "unknown" }
+                    return "\(value.usedPct)% captured=\(value.capturedAt.map(String.init(describing:)) ?? "unknown") reset=\(value.resetsAt.map(String.init(describing:)) ?? "unknown") expired=\(value.isExpired())"
+                }
+                print("  \(row.name) tier=\(row.tier) \(row.detail) 5h=\(window(row.fiveHour)) week=\(window(row.sevenDay)) secondary=\(row.secondaryPoolName) 5h=\(window(row.secondaryFiveHour)) week=\(window(row.secondarySevenDay))")
+            }
+        }
+    }
+    exit(0)
+}
+
+// `VibeGauge --debug-remote`：排查远程用量拉取（脚本是否找到 / 主机列表 / 每台的结果或失败原因）
+if CommandLine.arguments.contains("--debug-remote") {
+    var lines: [String] = []
+    lines.append("采集脚本: " + (RemoteCollector.script() == nil ? "读不到" : "已找到"))
+    lines.append("主机列表: \(RemoteCollector.hosts())")
+    for host in RemoteCollector.hosts() {
+        switch RemoteCollector.pullUsage(host: host, since: 0) {
+        case .success(let pull): lines.append("\(host): 成功 \(pull.records.count) 条 · maxUpdated=\(pull.maxUpdated)")
+        case .failure(let reason): lines.append("\(host): 失败 · \(reason)")
+        }
+    }
+    let text = lines.joined(separator: "\n") + "\n"
+    try? text.write(toFile: "/tmp/vibegauge-remote-debug.txt", atomically: true, encoding: .utf8)
+    print(text, terminator: "")
+    exit(0)
+}
+
+// `VibeGauge --render-panel <目录>`：不开菜单，把各页面板渲染成 PNG（深色 / 浅色各一套），给 README 截图和界面检查用。
+if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
+    let dir = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "."
+    _ = NSApplication.shared
+    NetworkScanner.shared.start()
+    UsageHistory.shared.start()
+    let report = ProcessScanner.shared.scan(refreshRemote: false)
+    var waited = 0.0
+    while (UsageHistory.shared.snapshot().capturedAt == 0 || NetworkScanner.shared.snapshot().capturedAt == 0) && waited < 300 {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
+        waited += 0.5
+    }
+    NerfDetector.shared.refreshNow(history: UsageHistory.shared.snapshot())
+    let savedArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+    let pages: [(name: String, tab: Int, drill: String?)] = [("subscription", 0, nil), ("api", 1, nil), ("stats", 2, nil),
+                                                             ("network", 3, nil), ("system", 4, nil), ("health", 0, DashboardView.healthPage),
+                                                             ("prices", 0, DashboardView.pricesPage)]
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    for dark in [true, false] {
+        for page in pages {
+            var arguments = savedArguments
+            arguments["vg.tab"] = page.tab
+            UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+            let body = DashboardView(report: report, settings: PanelSettings(), actions: PanelActions(), preload: true, drill: page.drill)
+                .renderBody
+                .background(dark ? Color(red: 0.14, green: 0.14, blue: 0.15) : Color(red: 0.95, green: 0.95, blue: 0.96))
+                .environment(\.colorScheme, dark ? .dark : .light)
+            MainActor.assumeIsolated {
+                // NSHostingView 离屏绘制：ImageRenderer 画不出分段 Picker / 按钮这类 AppKit 控件（会变成黄底禁止符号）
+                let host = NSHostingView(rootView: body)
+                host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                let size = host.fittingSize
+                host.frame = NSRect(origin: .zero, size: size)
+                let win = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                win.contentView = host
+                host.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
+                if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                    host.cacheDisplay(in: host.bounds, to: rep)
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        try? png.write(to: URL(fileURLWithPath: "\(dir)/panel-\(page.name)-\(dark ? "dark" : "light").png"))
+                    }
+                }
+            }
+        }
+    }
+    UserDefaults.standard.setVolatileDomain(savedArguments, forName: UserDefaults.argumentDomain)
+    let h = UsageHistory.shared.snapshot()
+    for (source, cost) in h.costBySource.sorted(by: { $0.key < $1.key }) { print("  \(source): \(Fmt.money(cost)) · \(h.totals[source].map { Fmt.tokens($0.tokenTotal) } ?? "-")") }
+    if let f = h.forecast { print("  预测：今天 \(f.todaySoFar) → \(f.todayProjected)；本月 \(f.monthSoFar) → \(f.monthProjected)") }
+    let month = UsageHistory.dayKey(timestamp: Date().timeIntervalSince1970).prefix(7)
+    print("  本月逐日：" + h.dailyCost.filter { $0.key.hasPrefix(month) }.sorted { $0.key < $1.key }.map { "\($0.key.suffix(2))=\(Int($0.value))" }.joined(separator: " "))
+    print("已渲染到 \(dir)")
+    exit(0)
+}
+
 // `VibeGauge --selftest`：不起 UI，校验纯函数 + 打印一次完整扫描结果（档位/额度/Token 去重后数据）
 if CommandLine.arguments.contains("--selftest") {
+    // Herdr discovery validation, normalized quota parsing, stale/missing preservation.
+    do {
+        let devices = RemoteCollector.parseHerdrMachines("""
+        [{"target":"fixture-ssh","label":"Research","enabled":true},
+         {"target":"fixture-ssh","label":"Duplicate","enabled":true},
+         {"target":"disabled","enabled":false},{"target":"invalid;echo","enabled":true},
+         {"target":"not-a-bool","enabled":1}]
+        """)
+        precondition(devices?.count == 1 && devices?.first?.target == "fixture-ssh" && devices?.first?.label == "Research")
+        precondition(RemoteCollector.parseHerdrMachines("{}") == nil)
+        precondition(RemoteCollector.finiteNumber(true) == nil)
+        precondition(RemoteCollector.finiteNumber(Double.infinity) == nil)
+        precondition(RemoteCollector.parseQuotaWindow(["used_percentage": true]) == nil)
+        precondition(RemoteCollector.parseQuotaWindow(["used_percentage": 101]) == nil)
+        precondition(RemoteCollector.parseQuotaWindow(["used_percentage": 42, "resets_at": 1e300, "captured_at": 1e300])?.resetsAt == nil)
+        let text = """
+        {"__summary__":{"platforms":{"claude":{"tier":"Max","sessions":2,"captured_at":1700000000,"quota":{"five_hour":{"used_percentage":31.5,"resets_at":1700000300,"window_seconds":18000},"seven_day":{"used_percentage":false}}},"codex":{"sessions":0,"quota":{}},"grok":{"sessions":true,"note":"session_count_unavailable","quota":{"seven_day":{"used_percentage":0,"captured_at":1700000100}}},"agy":{"sessions":1,"quota":{"secondary_name":"3p","secondary_five_hour":{"used_percentage":75,"captured_at":1700000200}}}}}}
+        {"__ok__":true}
+        """
+        let rows = RemoteCollector.parseQuotas(text)!
+        precondition(rows.map { $0.name } == ["Claude", "Codex", "Grok", "Antigravity"])
+        let claude = rows[0]
+        precondition(claude.fiveHour?.usedPct == 32 && claude.fiveHour?.capturedAt == 1700000000)
+        precondition(claude.fiveHour?.windowSeconds == 18000 && claude.fiveHour!.isExpired(now: 1800000000))
+        precondition(claude.sevenDay == nil && claude.isRunning)
+        precondition(!rows[1].hasQuota && rows[2].sevenDay?.usedPct == 0 && !rows[2].isRunning)
+        precondition(rows[2].detail == L("会话数未知", "Sessions unknown"))
+        precondition(rows[3].secondaryFiveHour?.capturedAt == 1700000200)
+        precondition(RemoteCollector.parseQuotas(text.replacingOccurrences(of: "\"__ok__\":true", with: "\"__ok__\":false")) == nil)
+        precondition(RemoteCollector.parseQuotas(text.replacingOccurrences(of: "\"__ok__\":true", with: "\"__ok__\":1")) == nil)
+        let missing = DetectedLLMRuntime(name: "Claude", isRunning: false, tier: "", detail: "")
+        let retained = ProcessScanner.retainingMissingQuotas([missing], previous: [claude])[0]
+        precondition(retained.fiveHour == claude.fiveHour && !retained.isRunning && !retained.quotaNote.isEmpty)
+        let omitted = ProcessScanner.retainingMissingQuotas([], previous: [claude])[0]
+        precondition(omitted.fiveHour == claude.fiveHour && !omitted.isRunning)
+        let realZero = DetectedLLMRuntime(name: "Claude", isRunning: false, tier: "", detail: "", fiveHour: QuotaWindow(usedPct: 0))
+        precondition(ProcessScanner.retainingMissingQuotas([realZero], previous: [claude])[0].fiveHour?.usedPct == 0)
+        let now: TimeInterval = 1800000000
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, resetsAt: now + 3600, capturedAt: now - 60), now: now) == .current)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now - 901), now: now) == .old)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now - 900), now: now) == .current)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42), now: now) == .undated)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, resetsAt: now, capturedAt: now - 60), now: now) == .reset)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now + 61), now: now) == .old)
+        precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now + 60), now: now) == .current)
+    }
     precondition(Fmt.modelDisplayName("claude-fable-5-1") == "Fable 5.1")
     precondition(Fmt.modelDisplayName("claude-opus-5") == "Opus 5")
     precondition(Fmt.modelDisplayName("claude-sonnet-4-5-20250929") == "Sonnet 4.5")
@@ -85,6 +247,76 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(t.cost(model: "unknown-model", ctx: 999, cacheRead: 0, cacheWrite: 0, out: 9) == nil, "没价的模型不许估")
         precondition(t.cost(model: "zero-price-placeholder", ctx: 999, cacheRead: 0, cacheWrite: 0, out: 9) == nil, "占位行不算价")
         precondition(ProcessScanner.PriceTable().isEmpty)
+    }
+
+    // 用户覆盖价只按行内 Fast 倍率加价，不继承内置 priority 价或重复乘倍率。
+    do {
+        let row: [String: Any] = ["in": 10, "cache_read": 1, "cache_write": 12.5, "out": 50, "fast_multiplier": 2]
+        let engine = CostEngine(user: ProcessScanner.PriceTable(json: ["gpt-6-astra": row]))
+        func cost(_ tier: String?) -> Double {
+            engine.cost(model: "gpt-6-astra", ctx: 1_000_000, cacheRead: 200_000, cacheWrite: 200_000, out: 100_000, tier: tier)!.value
+        }
+        precondition(abs(cost(nil) - 13.7) < 1e-9)
+        for tier in ["fast", "priority", "  FAST\n", " Priority "] {
+            precondition(abs(cost(tier) - 27.4) < 1e-9, "自定义 Fast 只能加价一次：\(tier)")
+        }
+        precondition(abs(cost("default") - 13.7) < 1e-9 && abs(cost("unknown") - 13.7) < 1e-9)
+        for (ctx, read, write, out, expected): (Int64, Int64, Int64, Int64, Double) in [
+            (1_000_000, 0, 0, 0, 20), (1_000_000, 1_000_000, 0, 0, 2),
+            (1_000_000, 0, 1_000_000, 0, 25), (0, 0, 0, 1_000_000, 100),
+        ] {
+            precondition(engine.cost(model: "gpt-6-astra", ctx: ctx, cacheRead: read, cacheWrite: write, out: out, tier: "fast")!.value == expected)
+        }
+        var plain = row; plain.removeValue(forKey: "fast_multiplier")
+        precondition(CostEngine(user: ProcessScanner.PriceTable(json: ["gpt-6-astra": plain])).cost(model: "gpt-6-astra", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0, tier: "priority")!.value == 10)
+        for value: Any in [1, true, false, 0, 0.5, -1, "2", NSNull(), Double.infinity, -Double.infinity, Double.nan] {
+            var invalid = row; invalid["fast_multiplier"] = value
+            let table = ProcessScanner.PriceTable(json: ["gpt-6-astra": invalid])
+            precondition(table.rows["gpt-6-astra"]?.fastMultiplier == 1)
+            precondition(table.cost(model: "gpt-6-astra", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0, tier: "fast") == 10)
+        }
+        let parsed = try JSONSerialization.jsonObject(with: Data(#"{"gpt-6-astra":{"in":10,"fast_multiplier":true}}"#.utf8)) as! [String: Any]
+        precondition(ProcessScanner.PriceTable(json: parsed).rows["gpt-6-astra"]?.fastMultiplier == 1, "JSON boolean 不能当倍率")
+    } catch { preconditionFailure("自定义 Fast 价自测失败：\(error)") }
+
+    // 峰谷价：同一模型同一用量，峰时按峰价、闲时按闲价；没配 _peak/offpeak 就恒用峰价（老行为）
+    do {
+        let json: [String: Any] = [
+            "_currency": "CNY",
+            "_peak": ["tz": "Asia/Shanghai", "windows": ["09:00-12:00", "14:00-18:00"]],
+            "ds": ["in": 9.0, "cache_read": 0.3, "out": 27.0, "fast_multiplier": 2, "offpeak": ["in": 4.5, "cache_read": 0.15, "out": 13.5]],
+            "flat": ["in": 2.0, "out": 4.0],
+        ]
+        let t = ProcessScanner.PriceTable(json: json)
+        func at(_ hhmm: String) -> Date {
+            var comp = DateComponents()
+            comp.year = 2026; comp.month = 9; comp.day = 22
+            comp.hour = Int(hhmm.prefix(2)); comp.minute = Int(hhmm.suffix(2))
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+            return cal.date(from: comp)!
+        }
+        // 100 万新鲜输入 + 100 万输出
+        precondition(abs((t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("10:00")) ?? -1) - 36.0) < 1e-9, "峰时该是 9+27")
+        precondition(abs((t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("20:00")) ?? -1) - 18.0) < 1e-9, "闲时该是 4.5+13.5")
+        precondition(abs((t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("12:30")) ?? -1) - 18.0) < 1e-9, "12:30 落在窗口外")
+        precondition(t.cost(model: "flat", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("20:00")) == 6.0, "没配闲时价就全天同价")
+        precondition(t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000) == 36.0, "不传时间恒用峰价")
+        precondition(t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("10:00"), tier: "fast") == 72.0)
+        precondition(t.cost(model: "ds", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000_000, at: at("20:00"), tier: "priority") == 36.0)
+    }
+
+    // 价格同步：0 价不算价；同名模型在多 provider 下出现时，优先 provider 的那条赢
+    do {
+        let root: [String: Any] = [
+            "deepseek": ["models": ["deepseek-v4-pro": ["cost": ["input": 0.435, "output": 0.87, "cache_read": 0.003625]]]],
+            "some-aggregator": ["models": ["deepseek-v4-pro": ["cost": ["input": 9.0, "output": 27.0]]]],
+            "empty-provider": ["models": ["nothing": ["cost": ["input": 0, "output": 0]]]],
+        ]
+        let parsed = PriceSync.parse(root)
+        precondition(parsed["deepseek-v4-pro"]?["in"] == 0.435, "优先 provider 该赢，实际 \(String(describing: parsed["deepseek-v4-pro"]))")
+        precondition(parsed["nothing"] == nil, "0 价不算价")
+        precondition(parsed.count == 1, "实际 \(parsed.count) 条")
     }
 
     // 订阅制 Coding Plan 的额度估算：滚动窗口内的请求数 ÷ 上限
@@ -293,6 +525,69 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(defaults.integer(forKey: "vg.tab") == 2, "迁移只能执行一次")
     }
 
+    // 设备作用域：序列化往返 + 「来源属于哪台设备」的归属判定
+    do {
+        precondition(DeviceScope.from(key: "all") == .all)
+        precondition(DeviceScope.from(key: "local") == .local)
+        precondition(DeviceScope.from(key: "remote:wsl") == .remote("wsl"))
+        precondition(DeviceScope.from(key: "remote:") == .all, "空主机名回落全部")
+        precondition(DeviceScope.from(key: "nonsense") == .all)
+        precondition(DeviceScope.all.key == "all")
+        precondition(DeviceScope.local.key == "local")
+        precondition(DeviceScope.remote("wsl").key == "remote:wsl")
+        precondition(DeviceScope.from(key: DeviceScope.remote("box").key) == .remote("box"))
+        precondition(DeviceScope.remote("gone").resolved(hosts: ["wsl", "gpu"]) == .all, "主机被删后回落全部")
+        precondition(DeviceScope.remote("wsl").resolved(hosts: ["wsl", "gpu"]) == .remote("wsl"))
+
+        let hosts = ["wsl", "gpu"]
+        precondition(DeviceScope.includes(source: "Claude", scope: .all, hosts: hosts))
+        precondition(DeviceScope.includes(source: "OpenCode · wsl", scope: .all, hosts: hosts))
+        precondition(DeviceScope.includes(source: "Claude", scope: .local, hosts: hosts))
+        precondition(DeviceScope.includes(source: "OpenCode", scope: .local, hosts: hosts))
+        precondition(DeviceScope.includes(source: "API · GLM", scope: .local, hosts: hosts), "API 记账算本机")
+        precondition(!DeviceScope.includes(source: "OpenCode · wsl", scope: .local, hosts: hosts), "远程来源不算本机")
+        precondition(!DeviceScope.includes(source: "OpenCode · removed", scope: .local, hosts: hosts), "已移除远程设备的历史不混入本机")
+        precondition(DeviceScope.includes(source: "OpenCode · wsl", scope: .remote("wsl"), hosts: hosts))
+        precondition(!DeviceScope.includes(source: "OpenCode · gpu", scope: .remote("wsl"), hosts: hosts), "别的远程主机不算")
+        precondition(!DeviceScope.includes(source: "Claude", scope: .remote("wsl"), hosts: hosts), "本机来源不算远程")
+
+        var localCodex = CLIUsage(name: "Codex")
+        localCodex.ctx = 100; localCodex.cacheRead = 60; localCodex.out = 10; localCodex.requests = 2
+        let localRows = [localCodex, CLIUsage(name: "Claude Code")]
+        let today: [String: UsageHistory.Totals] = [
+            "Codex": .init(ctx: 150, cacheRead: 60, out: 15, turns: 3),
+            "Codex · wsl": .init(ctx: 300, cacheRead: 200, out: 30, think: 5, turns: 3),
+            "Codex · gpu": .init(ctx: 500, cacheRead: 400, out: 50, think: 7, turns: 4),
+            "OpenCode": .init(ctx: 20, out: 2, turns: 1),
+            "API · Codex": .init(ctx: 9000, out: 900, turns: 90)
+        ]
+        let allRows = DeviceScope.todayUsage(local: localRows, history: today, scope: .all)
+        let allCodex = allRows.first { $0.name == "Codex" }!
+        precondition(allCodex.ctx == 950 && allCodex.out == 95 && allCodex.cacheRead == 660 && allCodex.think == 12)
+        precondition(allCodex.requests == 10, "全部合并各设备，本机实时行和 API 代理不重复计数")
+        precondition(allRows.first { $0.name == "opencode" }?.ctx == 20)
+        let localOnly = DeviceScope.todayUsage(local: localRows, history: today, scope: .local)
+        precondition(localOnly.first { $0.name == "Codex" }?.ctx == 150, "以包括归档记录的历史为准")
+        let wslOnly = DeviceScope.todayUsage(local: localRows, history: today, scope: .remote("wsl"))
+        precondition(wslOnly.count == 1 && wslOnly[0].ctx == 300 && wslOnly[0].requests == 3)
+        precondition(DeviceScope.todayUsage(local: localRows, history: [:], scope: .remote("wsl")).isEmpty)
+        precondition(DeviceScope.todayUsage(local: localRows, history: [:], scope: .local).first { $0.name == "Codex" }?.ctx == 0)
+        precondition(DeviceScope.todayUsage(local: localRows, history: [:], scope: .all, historyReady: false).first { $0.name == "Codex" }?.ctx == 100)
+        precondition(DeviceScope.todayUsage(local: localRows, history: today, scope: .remote("wsl"), historyReady: false).isEmpty)
+        var grok = CLIUsage(name: "Grok"); grok.turns = 7; grok.note = "no token fields"
+        precondition(DeviceScope.todayUsage(local: [grok], history: today, scope: .all).first { $0.name == "Grok" }?.turns == 7)
+        var snapshot = UsageHistory.Snapshot()
+        let midnight = Fmt.parseISODate("2026-10-01T16:00:00Z")!
+        let timeZone = TimeZone(identifier: "Asia/Shanghai")!
+        snapshot.capturedAt = midnight - 1; snapshot.todayBySource = today
+        precondition(snapshot.currentDaySources(at: midnight - 1, timeZone: timeZone) == today)
+        let nextDay = snapshot.currentDaySources(at: midnight, timeZone: timeZone)
+        precondition(nextDay.isEmpty)
+        precondition(DeviceScope.todayUsage(local: localRows, history: nextDay, scope: .all,
+                                          historyReady: snapshot.capturedAt > 0).first { $0.name == "Codex" }?.ctx == 0,
+                     "昨日快照进入新一天后不能回退旧的本机今日行")
+    }
+
     do {
         precondition(UsageHistory.levels([]) == [])
         precondition(UsageHistory.levels([0, 0, -1]) == [0, 0, 0])
@@ -320,6 +615,72 @@ if CommandLine.arguments.contains("--selftest") {
         let merged = UsageHistory.deduplicateClaude(["file-a": [a, updated], "file-b": [updated]])
         precondition(merged.count == 1 && merged[a.id]?.usage.out == 20)
         precondition(Fmt.tokens(10_000) == "1.0 万" && Fmt.tokens(100_000_000) == "1.00 亿")
+    }
+
+    // opencode：total = input + output + reasoning + cache.read + cache.write，映射后必须等于 ctx + out
+    do {
+        let row = OpenCodeUsage.Row(id: "msg_fixture", session: "ses_fixture", provider: "deepseek", model: "deepseek-v4-pro",
+                                    createdAt: 1_781_494_632, input: 22_011, output: 328, reasoning: 72, cacheRead: 3_968, cacheWrite: 0)
+        let totals = OpenCodeUsage.totals(row)
+        precondition(totals.ctx == 25_979 && totals.cacheRead == 3_968 && totals.cacheWrite == 0, "实际 \(totals)")
+        precondition(totals.out == 400 && totals.think == 72, "思考要含在输出里")
+        precondition(totals.tokenTotal == 26_379, "必须等于 opencode 的 total")
+        let records = OpenCodeUsage.records(rows: [row])
+        precondition(records["msg_fixture"]?.source == "OpenCode" && records["msg_fixture"]?.session == "ses_fixture")
+        precondition(records["msg_fixture"]?.model == "deepseek-v4-pro")
+        let blank = OpenCodeUsage.Row(id: "", session: nil, provider: "", model: "", createdAt: 0,
+                                      input: 1, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0)
+        precondition(OpenCodeUsage.records(rows: [blank]).isEmpty, "没有 id 的行不许进统计")
+    }
+
+    // 远程采集：坏行跳过、哨兵说成功才认、max_u 供增量游标
+    do {
+        let jsonl = """
+        {"id":"msg_a","t":1781494632,"u":1781494641564,"s":"ses_1","m":"deepseek-v4-flash","p":"deepseek","in":229,"out":387,"r":28,"cr":7680,"cw":0}
+        这一行不是 JSON
+        {"id":"msg_b","t":1781494641,"u":1781494646770,"s":"ses_1","m":"deepseek-v4-flash","p":"deepseek","in":0,"out":0,"r":0,"cr":0,"cw":0}
+        {"__ok__":true,"count":2,"max_u":1781494646770}
+        """
+        let parsed = RemoteCollector.parse(jsonl: jsonl, source: "OpenCode · fixture-host")
+        precondition(parsed.ok && parsed.records.count == 2, "实际 \(parsed.records.count) 条")
+        precondition(parsed.maxUpdated == 1_781_494_646_770, "实际 \(parsed.maxUpdated)")
+        precondition(parsed.records.allSatisfy { $0.source == "OpenCode · fixture-host" })
+        precondition(parsed.records.first { $0.id == "msg_a" }?.usage.tokenTotal == 8_324)
+        precondition(!RemoteCollector.parse(jsonl: #"{"__ok__":false,"error":"x"}"#, source: "s").ok, "哨兵说失败就不认")
+        precondition(!RemoteCollector.parse(jsonl: #"{"id":"a","t":1}"#, source: "s").ok, "没有哨兵不能当成功")
+    }
+
+    // opencode 真库路径：临时建库 → 走完整汇总 → 库被删/读坏都要保留已缓存历史
+    do {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("vibegauge-opencode-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dbPath = root.appendingPathComponent("opencode.db").path
+        var handle: OpaquePointer?
+        precondition(sqlite3_open(dbPath, &handle) == SQLITE_OK && handle != nil, "临时库建不出来")
+        defer { sqlite3_close(handle) }
+        let seed = """
+        CREATE TABLE message(id text primary key, session_id text not null, time_created integer not null, time_updated integer not null, data text not null);
+        INSERT INTO message VALUES ('msg_1','ses_1',1781494632598,1781494632598,'{"role":"assistant","providerID":"deepseek","modelID":"deepseek-v4-pro","tokens":{"total":26379,"input":22011,"output":328,"reasoning":72,"cache":{"read":3968,"write":0}}}');
+        INSERT INTO message VALUES ('msg_2','ses_1',1781494641355,1781494641355,'{"role":"assistant","providerID":"deepseek","modelID":"deepseek-v4-flash","tokens":{"total":8324,"input":229,"output":387,"reasoning":28,"cache":{"read":7680,"write":0}}}');
+        INSERT INTO message VALUES ('msg_user','ses_1',1781494630000,1781494630000,'{"role":"user"}');
+        INSERT INTO message VALUES ('msg_none','ses_1',1781494640000,1781494640000,'{"role":"assistant"}');
+        """
+        precondition(sqlite3_exec(handle, seed, nil, nil, nil) == SQLITE_OK, "灌数据失败")
+        let collector = UsageHistory(home: root.path, opencodeDB: dbPath)
+        collector.scanNowForTesting()
+        var opencode = collector.snapshot().totals["OpenCode"]
+        precondition(opencode?.ctx == 33_888 && opencode?.out == 815, "实际 \(String(describing: opencode))")
+        precondition(opencode?.turns == 2 && opencode?.sessions == 1, "同一 session 的两条消息只算一个会话")
+        precondition(opencode?.models["deepseek-v4-pro"]?.ctx == 25_979)
+        precondition(collector.snapshot().error.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+        collector.scanNowForTesting()
+        opencode = collector.snapshot().totals["OpenCode"]
+        precondition(opencode?.turns == 2, "库被删也要保留已缓存历史")
+        try? Data("这不是一个数据库".utf8).write(to: URL(fileURLWithPath: dbPath))
+        collector.scanNowForTesting()
+        precondition(collector.snapshot().totals["OpenCode"]?.turns == 2, "库读坏也要保留上次汇总")
     }
 
     // 临时目录覆盖真实增量路径：重启、跨文件去重、追加半行、重写、模型成本重算。
@@ -362,13 +723,13 @@ if CommandLine.arguments.contains("--selftest") {
                   + codex(after, total: ["input_tokens": 80, "cached_input_tokens": 16, "output_tokens": 8]))
         try write(".config/vibegauge/api-calls.jsonl", try line(["ts": after, "host": "example.test", "provider": "Fixture A", "model": "fixture-priced", "ctx": 30, "cache_read": 5, "out": 3])
                   + line(["ts": after, "host": "example.test", "provider": "Fixture B", "model": "fixture-unpriced", "ctx": 50, "cache_write": 10, "out": 4]))
-        let collector = UsageHistory(home: root.path)
+        let collector = UsageHistory(home: root.path, opencodeDB: root.appendingPathComponent("no-opencode.db").path)
         collector.scanNowForTesting()
         var snap = collector.snapshot()
         precondition(snap.totals["Claude"]?.ctx == 45 && snap.totals["Claude"]?.out == 10 && snap.totals["Claude"]?.turns == 2 && snap.totals["Claude"]?.sessions == 2)
         precondition(snap.totals["Codex"]?.ctx == 320 && snap.totals["Codex"]?.out == 32 && snap.totals["Codex"]?.turns == 5 && snap.totals["Codex"]?.sessions == 2)
         precondition(snap.totals["API · Fixture A"]?.ctx == 30 && snap.totals["API · Fixture B"]?.ctx == 50)
-        precondition(snap.cost == nil && !snap.hasPriceTable && snap.error.isEmpty)
+        precondition(snap.costByCurrency.isEmpty && !snap.hasPriceTable && snap.error.isEmpty)
         let cacheURL = root.appendingPathComponent(".config/vibegauge/usage-daily.json")
         func checkCachePermissions() throws {
             let file = try FileManager.default.attributesOfItem(atPath: cacheURL.path)
@@ -380,7 +741,7 @@ if CommandLine.arguments.contains("--selftest") {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cacheURL.deletingLastPathComponent().path)
         // 保存有节流，重启实例并追加空行才能触发真实写入，同时保持统计结果不变。
         try write(ca, "\n", append: true)
-        UsageHistory(home: root.path).scanNowForTesting()
+        UsageHistory(home: root.path, opencodeDB: root.appendingPathComponent("no-opencode.db").path).scanNowForTesting()
         try checkCachePermissions()
         let disk = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as! [String: Any]
         let states = disk["files"] as! [String: [String: Any]]
@@ -390,10 +751,10 @@ if CommandLine.arguments.contains("--selftest") {
         // 人工测试价目表只作用于临时目录中的 fixture 模型，不提供任何生产默认价格。
         try write(".config/vibegauge/prices.json", try line(["_currency": "TEST", "fixture-priced": ["in": 1, "cache_read": 2, "cache_write": 3, "out": 4]]))
         collector.scanNowForTesting(); snap = collector.snapshot()
-        precondition(abs((snap.cost ?? -1) - 0.000594) < 1e-10 && snap.unpricedModels == 2)
+        precondition(abs((snap.costByCurrency["TEST"] ?? -1) - 0.000594) < 1e-10 && snap.unpricedModels == 2)
         try write(".config/vibegauge/prices.json", try line(["_currency": "TEST", "fixture-priced": ["in": 2, "cache_read": 4, "cache_write": 6, "out": 8]]))
         collector.scanNowForTesting()
-        precondition(abs((collector.snapshot().cost ?? -1) - 0.001188) < 1e-10)
+        precondition(abs((collector.snapshot().costByCurrency["TEST"] ?? -1) - 0.001188) < 1e-10)
         let added = try claude("fixture-3", after, 7, 1)
         let split = added.index(added.startIndex, offsetBy: added.count / 2)
         try write(ca, String(added[..<split]), append: true)
@@ -406,10 +767,249 @@ if CommandLine.arguments.contains("--selftest") {
         try write(ca, try claude("fixture-5", after, 3, 1))
         collector.scanNowForTesting(); snap = collector.snapshot()
         precondition(snap.totals["Claude"]?.turns == 2 && snap.totals["Claude"]?.ctx == 13, "重写必须撤销旧文件贡献")
-        let restarted = UsageHistory(home: root.path)
+        let restarted = UsageHistory(home: root.path, opencodeDB: root.appendingPathComponent("no-opencode.db").path)
         restarted.scanNowForTesting()
         precondition(restarted.snapshot().totals == snap.totals && restarted.snapshot().error.isEmpty)
     } catch { preconditionFailure("统计临时日志自测失败：\(error)") }
+
+    // 内置价：归一化、最长前缀（gpt-5 不许抢 gpt-5.6-x）、别名、1h 缓存、长上下文整单升档、priority 明码价、用户价优先
+    do {
+        let cat = PricingCatalog.parse([
+            "_asof": "2026-09-28", "_aliases": ["gpt-reserve": "gpt-5.6-luna"],
+            "claude-opus-5": ["in": 5, "out": 25, "cr": 0.5, "cw": 6.25, "cw1h": 10],
+            "gpt-6-astra": ["in": 10, "out": 50, "cr": 1, "cw": 12.5, "lc": ["threshold": 272000, "in": 20, "out": 75, "cr": 2, "cw": 25],
+                            "pri": ["in": 20, "out": 100, "cr": 2], "fast": 2],
+            "gpt-5": ["in": 1.25, "out": 10, "cr": 0.125],
+            "gpt-5.6-luna": ["in": 0.2, "out": 1.2, "cr": 0.02],
+        ])
+        precondition(cat.asOf == "2026-09-28" && cat.entries.count == 4)
+        precondition(PricingCatalog.normalize("anthropic/claude-opus-4.5-20251101[1m]") == "claude-opus-4-5", PricingCatalog.normalize("anthropic/claude-opus-4.5-20251101[1m]"))
+        precondition(PricingCatalog.entry(for: "claude-opus-5-20260101", in: cat) != nil)
+        precondition(PricingCatalog.entry(for: "gpt-5.6-sol", in: cat) == nil, "gpt-5 不许抢走 gpt-5.6-x")
+        precondition(PricingCatalog.entry(for: "gpt-5-mini", in: cat) == nil, "独立模型不能借用同族价格")
+        precondition(PricingCatalog.entry(for: "gpt-5-high", in: cat) == cat.entries["gpt-5"], "日志的推理档位后缀允许匹配")
+        precondition(PricingCatalog.entry(for: "gpt-reserve", in: cat) == cat.entries["gpt-5.6-luna"])
+        let opus = PricingCatalog.entry(for: "claude-opus-5", in: cat)!
+        let c1 = PricingCatalog.cost(opus, ctx: 4_000_000, cacheRead: 2_000_000, cacheWrite: 1_000_000, cacheWrite1h: 400_000, out: 100_000)
+        precondition(abs(c1 - 16.25) < 1e-9, "opus 1h 缓存算出 \(c1)")
+        let astra = cat.entries["gpt-6-astra"]!
+        precondition(abs(PricingCatalog.cost(astra, ctx: 100_000, cacheRead: 50_000, cacheWrite: 0, out: 10_000) - 1.05) < 1e-9)
+        precondition(abs(PricingCatalog.cost(astra, ctx: 300_000, cacheRead: 100_000, cacheWrite: 0, out: 10_000) - 4.95) < 1e-9, "超过 272k 整单按长上下文价")
+        precondition(abs(PricingCatalog.cost(astra, ctx: 100_000, cacheRead: 50_000, cacheWrite: 0, out: 10_000, tier: "priority") - 2.1) < 1e-9)
+        let engine = CostEngine(user: ProcessScanner.PriceTable(json: ["_currency": "CNY", "gpt-6-astra": ["in": 1, "out": 1]]), catalog: cat)
+        precondition(engine.cost(model: "gpt-6-astra", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)?.currency == "CNY", "用户价优先")
+        precondition(engine.cost(model: "claude-opus-5", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)?.currency == "USD")
+        precondition(engine.isPriced("chatgpt-web/pro") && engine.cost(model: "chatgpt-web/pro", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 1_000)?.value == 0, "网页订阅记 0 成本")
+        let builtinEngine = CostEngine(catalog: PricingCatalog.builtin)
+        let g3 = builtinEngine.cost(model: "gemini-3-pro-high", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)?.value ?? 0
+        precondition(abs(g3 - 4.0) < 1e-9, "gemini-3-pro 超 200k 走长上下文价 $4/M")
+        precondition(abs((builtinEngine.cost(model: "gemini-3-pro-preview", ctx: 100_000, cacheRead: 0, cacheWrite: 0, out: 100_000)?.value ?? 0) - 1.4) < 1e-9)
+        precondition(engine.cost(model: "unknown-x", ctx: 1, cacheRead: 0, cacheWrite: 0, out: 1) == nil, "没价的模型不许估")
+        precondition(!PricingCatalog.builtin.isEmpty, "内置价没打进 bundle（build.sh 要拷 prices.builtin.json）")
+        precondition(PricingCatalog.entry(for: "gpt-6-sol") != nil && PricingCatalog.entry(for: "claude-opus-4-8") != nil)
+        let sol61 = PricingCatalog.builtin.entries["gpt-6.1-sol"]!
+        precondition(sol61.base.cacheRead == 0.1 && sol61.base.cacheWrite == 2.5)
+        precondition(abs(PricingCatalog.cost(sol61, ctx: 272001, cacheRead: 100000, cacheWrite: 50000, out: 10000, tier: "fast") - 1.816008) < 1e-9)
+        precondition(PricingCatalog.entry(for: "gpt-5.3-codex-spark") == nil)
+        let opus55 = PricingCatalog.builtin.entries["claude-opus-5-5"]!
+        let opusStandard = PricingCatalog.cost(opus55, ctx: 1_000_000, cacheRead: 300_000, cacheWrite: 200_000, cacheWrite1h: 100_000, out: 100_000)
+        precondition(abs(PricingCatalog.cost(opus55, ctx: 1_000_000, cacheRead: 300_000, cacheWrite: 200_000, cacheWrite1h: 100_000, out: 100_000, tier: "fast") - opusStandard * 2) < 1e-9)
+    }
+
+    // 金额预测：作息曲线 + 余量法，本月 = 已花 + 今天预测 + 剩余天数 × 日均；历史不足时按近 1 小时速度
+    do {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+        let now = Date(timeIntervalSince1970: Fmt.parseISODate("2026-09-18T04:00:00Z")!)   // 本地 12:00
+        let today = cal.startOfDay(for: now)
+        func key(_ back: Int) -> String { UsageHistory.dayKey(timestamp: cal.date(byAdding: .day, value: -back, to: today)!.timeIntervalSince1970, timeZone: cal.timeZone) }
+        var hourly: [String: [Double]] = [:]
+        for back in 1...10 { hourly[key(back)] = (0..<24).map { (9...20).contains($0) ? 1.0 : 0 } }
+        hourly[key(0)] = (0..<24).map { (9...11).contains($0) ? 1.0 : 0 }
+        let f = UsageForecast.compute(hourly: hourly, lastHourCost: 1, currency: "USD", now: now, calendar: cal)
+        precondition(abs(f.todaySoFar - 3) < 1e-9 && abs(f.todayProjected - 12) < 1e-6, "今天预测 \(f.todayProjected)")
+        precondition(abs(f.todayLow - 12) < 1e-6 && abs(f.todayHigh - 12) < 1e-6)
+        precondition(abs(f.monthProjected - 276) < 1e-6, "本月预测 \(f.monthProjected)")
+        precondition(f.recentCosts.count == 14 && f.recentCosts.last == 3 && f.profileDays == 10)
+        let thin = UsageForecast.compute(hourly: [key(0): hourly[key(0)]!], lastHourCost: 2, currency: "USD", now: now, calendar: cal)
+        precondition(abs(thin.todayProjected - 5) < 1e-9 && thin.basis.contains("不足"))
+        precondition(thin.monthConfidence == .insufficient && thin.historyDays == 0)
+        let early = ISO8601DateFormatter().date(from: "2026-09-30T16:05:00Z")!
+        var prior = Array(repeating: 0.0, count: 24); prior[23] = 254.89333333333335
+        var current = Array(repeating: 0.0, count: 24); current[0] = 3.41
+        let sparse = UsageForecast.compute(hourly: ["2026-09-30": prior, "2026-10-01": current], lastHourCost: 32.22, currency: "USD", now: early, calendar: cal)
+        precondition(sparse.historyDays == 1 && sparse.monthConfidence == .insufficient)
+        precondition(abs(sparse.todayProjected - 35.63) < 1e-9 && abs(sparse.monthProjected - 35.63) < 1e-9, "稀疏月初历史不外推整月")
+        precondition(sparse.monthLow >= sparse.monthSoFar && sparse.monthHigh >= sparse.monthProjected)
+        let t = now.timeIntervalSince1970
+        let block = UsageForecast.currentBlock([.init(timestamp: t - 3 * 3600, cost: 1), .init(timestamp: t - 2 * 3600, cost: 1),
+                                                .init(timestamp: t - 3600, cost: 1)], currency: "USD", now: t)!
+        precondition(block.isActive && block.requests == 3 && abs(block.perHour - 1) < 1e-9 && abs(block.projected - 5) < 1e-9, "块 \(block)")
+    }
+
+    // 峰谷价：按配置时区、星期与例外日期，周末/国庆不能只按钟点计峰价。
+    do {
+        let table = ProcessScanner.PriceTable(json: [
+            "_currency": "CNY", "_peak": ["tz": "Asia/Shanghai", "windows": ["09:00-12:00", "14:00-18:00"],
+                                             "weekdays": [2, 3, 4, 5, 6], "excluded_dates": ["2026-10-01"]],
+            "deepseek-flash": ["in": 2, "out": 8, "cache_read": 0.04, "offpeak": ["in": 1, "out": 4, "cache_read": 0.02]]
+        ])
+        func cost(_ iso: String) -> Double {
+            table.cost(model: "deepseek-flash", ctx: 1_000_000, cacheRead: 500_000, cacheWrite: 0, out: 100_000,
+                       at: ISO8601DateFormatter().date(from: iso))!
+        }
+        precondition(abs(cost("2026-09-30T02:00:00Z") - 1.82) < 1e-9, "工作日峰时")
+        precondition(abs(cost("2026-10-01T02:00:00Z") - 0.91) < 1e-9, "节假日为空闲价")
+        precondition(abs(cost("2026-10-04T02:00:00Z") - 0.91) < 1e-9, "周末为空闲价")
+        precondition(abs(cost("2026-10-08T02:00:00Z") - 1.82) < 1e-9, "例外日之后恢复工作日峰价")
+    }
+
+    // 降智：模型比较（移植 is-gpt-nerfed）+ 真实路径扫描临时日志
+    do {
+        precondition(NerfDetector.compare("gpt-6-astra", "gpt-5.6-sol").direction == "downgrade")
+        precondition(NerfDetector.compare("gpt-5.6-sol", "gpt-6-sol").direction == "upgrade")
+        precondition(NerfDetector.compare("claude-opus-4-8", "claude-sonnet-5").direction == "downgrade", "Claude 先比档位")
+        precondition(NerfDetector.compare("gpt-6-sol", "gpt-reserve", hidden: ["gpt-reserve"]).direction == "downgrade")
+        precondition(NerfDetector.compare("gpt-5.4", "gpt-5.4-mini").direction == "downgrade")
+        let v = NerfDetector.modelVersion("claude-sonnet-4-5-20250929")
+        precondition(v?.0 == 4 && v?.1 == 5)
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("vibegauge-nerf-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let iso = ISO8601DateFormatter()
+        let ts = iso.string(from: Date(timeIntervalSinceNow: -600))
+        func lines(_ rows: [[String: Any]]) -> Data {
+            Data((rows.map { String(decoding: try! JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }.joined(separator: "\n") + "\n").utf8)
+        }
+        let codexURL = root.appendingPathComponent(".codex/sessions/2026/09/28/rollout-fixture.jsonl")
+        try? FileManager.default.createDirectory(at: codexURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? lines([
+            ["type": "session_meta", "timestamp": ts, "payload": ["cwd": "/tmp/fixture-proj"]],
+            ["type": "turn_context", "timestamp": ts, "payload": ["model": "gpt-6-astra", "collaboration_mode": ["settings": ["reasoning_effort": "xhigh"]]]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "token_count", "info": ["model_context_window": 490200]]],
+            ["type": "turn_context", "timestamp": ts, "payload": ["model": "gpt-5.6-sol", "collaboration_mode": ["settings": ["reasoning_effort": "medium"]]]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "token_count", "info": ["model_context_window": 258400]]],
+        ]).write(to: codexURL)
+        let claudeURL = root.appendingPathComponent(".claude/projects/p/s.jsonl")
+        try? FileManager.default.createDirectory(at: claudeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? lines([
+            ["type": "assistant", "timestamp": ts, "message": ["model": "claude-opus-5"]],
+            ["type": "assistant", "timestamp": ts, "message": ["model": "claude-sonnet-5"]],
+            ["type": "user", "timestamp": ts, "message": ["content": "<command-name>/model</command-name>"]],
+            ["type": "assistant", "timestamp": ts, "message": ["model": "claude-opus-5"]],
+            ["type": "assistant", "timestamp": ts, "isSidechain": true, "message": ["model": "claude-haiku-4-5"]],
+        ]).write(to: claudeURL)
+        let r = NerfDetector(home: root.path).refreshNow()
+        let kinds = Set(r.findings.map { $0.id.components(separatedBy: "|").dropFirst().first ?? "" })
+        precondition(r.status == .alert, "应判为疑似降智：\(r.findings.map { $0.title })")
+        precondition(kinds.isSuperset(of: ["silent_model_change", "silent_effort_change", "context_window_change", "claude_model"]), "\(kinds)")
+        precondition(r.findings.filter { $0.source == "Claude" && $0.severity == .hard }.count == 1, "/model 之后的切换只算提示，子代理不算")
+        precondition(r.currentModels["Codex"] == "gpt-5.6-sol · medium")
+    }
+
+    // 远程逐条记录：解析、来源带设备名、id 加种类前缀、压缩往返；设备作用域 & 挂载配置
+    do {
+        let jsonl = """
+        {"k":"claude","id":"r1","t":1790000000,"m":"claude-opus-5","in":35,"cr":20,"cw":5,"c1":5,"out":9,"th":0,"s":"s1"}
+        {"k":"codex","id":"resp_1","t":1790000001,"m":"gpt-6-sol","in":100,"cr":40,"cw":0,"out":10,"th":2,"s":"rollout-a.jsonl","tier":"priority"}
+        坏行
+        {"__ok__":true,"count":2,"max_mtime":1790000000123}
+        """
+        let parsed = RemoteCollector.parseCLIRecords(jsonl: jsonl, host: "wsl")
+        precondition(parsed.ok && parsed.records.count == 2 && parsed.maxMtime == 1_790_000_000_123)
+        precondition(parsed.records.contains { $0.source == "Claude · wsl" && $0.cw1h == 5 && $0.id == "claude:r1" })
+        precondition(parsed.records.contains { $0.source == "Codex · wsl" && $0.tier == "priority" && $0.session == "rollout-a.jsonl" })
+        let blob = try (Data(jsonl.utf8) as NSData).compressed(using: .zlib) as Data
+        precondition(RemoteCollector.inflate(blob.base64EncodedString()) == jsonl, "压缩往返")
+        precondition(RemoteCollector.inflate("{\"a\":1}") == "{\"a\":1}")
+        precondition(DeviceScope.includes(source: "Claude · wsl", scope: .remote("wsl"), hosts: ["wsl"]))
+        precondition(!DeviceScope.includes(source: "Codex · wsl", scope: .local, hosts: ["wsl"]))
+        precondition(DeviceScope.includes(source: "API · GLM", scope: .local, hosts: ["wsl"]))
+        precondition(UsageHistory.device(of: "OpenCode · gpu") == "gpu" && UsageHistory.device(of: "API · GLM") == nil && UsageHistory.cli(of: "Codex · wsl") == "Codex")
+        let mounts = UsageHistory.parseMountRoots("wsl=/Volumes/w/home/me; /Volumes/lab ;bad label=/x")
+        precondition(mounts.map { $0.label } == ["wsl", "lab"] && mounts.first?.path == "/Volumes/w/home/me", "\(mounts)")
+    } catch { preconditionFailure("远程记录自测失败：\(error)") }
+
+    // 新口径：token_usage_record（response_id 去重）+ priority 档 + 归档副本只算一次 + Claude 1h 缓存 + 内置价
+    do {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("vibegauge-cost-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func put(_ relative: String, _ rows: [[String: Any]]) throws {
+            let url = root.appendingPathComponent(relative)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let text = try rows.map { String(decoding: try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]), as: UTF8.self) }.joined(separator: "\n") + "\n"
+            try Data(text.utf8).write(to: url)
+        }
+        let ts = ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -300))
+        func u(_ i: Int, _ c: Int, _ o: Int) -> [String: Any] { ["input_tokens": i, "cached_input_tokens": c, "cache_write_input_tokens": 0, "output_tokens": o, "reasoning_output_tokens": 0] }
+        let rollout: [[String: Any]] = [
+            ["type": "turn_context", "timestamp": ts, "payload": ["model": "gpt-6-astra"]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "thread_settings_applied", "thread_settings": ["service_tier": "priority"]]],
+            ["type": "token_usage_record", "timestamp": ts, "payload": ["response_id": "resp_1", "usage": u(100, 40, 10)]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "token_count", "info": ["total_token_usage": u(100, 40, 10), "last_token_usage": u(100, 40, 10)]]],
+            ["type": "token_usage_record", "timestamp": ts, "payload": ["response_id": "resp_2", "usage": u(50, 10, 5)]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "token_count", "info": ["total_token_usage": u(150, 50, 15), "last_token_usage": u(50, 10, 5)]]],
+        ]
+        try put(".codex/sessions/2026/09/18/rollout-x.jsonl", rollout)
+        try put(".codex/archived_sessions/rollout-x.jsonl", rollout)
+        try put(".claude/projects/p/a.jsonl", [["type": "assistant", "timestamp": ts, "requestId": "q1",
+            "message": ["model": "claude-opus-5", "usage": ["input_tokens": 10, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 5,
+                                                         "output_tokens": 9, "cache_creation": ["ephemeral_1h_input_tokens": 5]]]]])
+        let cat = PricingCatalog.parse(["_asof": "fixture",
+            "claude-opus-5": ["in": 5, "out": 25, "cr": 0.5, "cw": 6.25, "cw1h": 10],
+            "gpt-6-astra": ["in": 10, "out": 50, "cr": 1, "pri": ["in": 20, "out": 100, "cr": 2]]])
+        let collector = UsageHistory(home: root.path, opencodeDB: root.appendingPathComponent("none.db").path, catalog: cat)
+        collector.scanNowForTesting()
+        let snap = collector.snapshot()
+        precondition(snap.totals["Codex"]?.turns == 2 && snap.totals["Codex"]?.ctx == 150, "Codex \(String(describing: snap.totals["Codex"]))")
+        precondition(snap.totals["Claude"]?.turns == 1)
+        precondition(abs((snap.costBySource["Codex"]?["USD"] ?? -1) - 0.0036) < 1e-12, "priority 价 \(snap.costBySource)")
+        precondition(abs((snap.costBySource["Claude"]?["USD"] ?? -1) - 0.000335) < 1e-12, "1h 缓存价 \(snap.costBySource)")
+        precondition(!snap.hasPriceTable && snap.builtinPriceAsOf == "fixture" && snap.primaryCurrency == "USD")
+        precondition(abs((snap.forecastsByDevice["local"]?["USD"]?.recentCosts.reduce(0, +) ?? -1) - 0.003935) < 1e-12)
+        precondition(snap.forecastsByDevice["remote:wsl"] == nil, "本机预测不会伪造远程设备数据")
+    } catch { preconditionFailure("新口径自测失败：\(error)") }
+
+    // 历史记录 priority → default：修改真实 prices.json 后重算两档，token 与请求数保持不变。
+    do {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("vibegauge-custom-fast-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func put(_ relative: String, _ rows: [[String: Any]]) throws {
+            let url = root.appendingPathComponent(relative)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let text = try rows.map { String(decoding: try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]), as: UTF8.self) }.joined(separator: "\n") + "\n"
+            try Data(text.utf8).write(to: url)
+        }
+        let ts = ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -300))
+        func usage(_ i: Int, _ c: Int, _ o: Int) -> [String: Any] {
+            ["input_tokens": i, "cached_input_tokens": c, "output_tokens": o]
+        }
+        try put(".codex/sessions/2026/09/18/custom-fast.jsonl", [
+            ["type": "turn_context", "timestamp": ts, "payload": ["model": "gpt-6-astra"]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "thread_settings_applied", "thread_settings": ["service_tier": "priority"]]],
+            ["type": "token_usage_record", "timestamp": ts, "payload": ["response_id": "fast", "usage": usage(100, 40, 10)]],
+            ["type": "event_msg", "timestamp": ts, "payload": ["type": "thread_settings_applied", "thread_settings": ["service_tier": "default"]]],
+            ["type": "token_usage_record", "timestamp": ts, "payload": ["response_id": "standard", "usage": usage(50, 10, 5)]],
+        ])
+        let pricesPath = ".config/vibegauge/prices.json"
+        var price: [String: Any] = ["in": 1, "cache_read": 0.1, "out": 5]
+        try put(pricesPath, [["_currency": "TEST", "gpt-6-astra": price]])
+        let collector = UsageHistory(home: root.path, opencodeDB: root.appendingPathComponent("none.db").path)
+        collector.scanNowForTesting()
+        let before = collector.snapshot()
+        precondition(before.totals["Codex"]?.turns == 2 && before.totals["Codex"]?.ctx == 150 && before.totals["Codex"]?.out == 15)
+        precondition(abs((before.costBySource["Codex"]?["TEST"] ?? -1) - 0.00018) < 1e-12, "旧覆盖价保持最终价")
+        price["fast_multiplier"] = 2
+        try put(pricesPath, [["_currency": "TEST", "gpt-6-astra": price]])
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent(pricesPath))) as! [String: Any]
+        precondition(ProcessScanner.PriceTable(json: json).rows["gpt-6-astra"]?.fastMultiplier == 2)
+        collector.scanNowForTesting()
+        let after = collector.snapshot()
+        precondition(after.totals == before.totals, "价格重算不能改变 token 或请求数")
+        // priority: (60×1 + 40×0.1 + 10×5)×2；default: 40×1 + 10×0.1 + 5×5。
+        precondition(abs((after.costBySource["Codex"]?["TEST"] ?? -1) - 0.000294) < 1e-12, "只有 priority 记录加价一次")
+        collector.scanNowForTesting()
+        precondition(collector.snapshot().totals == after.totals && collector.snapshot().costBySource == after.costBySource, "再次扫描不能重复加价")
+    } catch { preconditionFailure("历史自定义 Fast 价自测失败：\(error)") }
 
     NetworkScanner.shared.start()
     UsageHistory.shared.start()
@@ -452,7 +1052,7 @@ if CommandLine.arguments.contains("--selftest") {
         print("\(l.isRunning ? "●" : "○") \(l.name) [\(l.tier)] \(l.detail)" + w("5H", l.fiveHour) + w("W", l.sevenDay) + w("\(l.secondaryPoolName)5H", l.secondaryFiveHour) + w("\(l.secondaryPoolName)W", l.secondarySevenDay) + (l.hasQuota ? "" : "  | \(l.quotaSubtitle)"))
     }
     let rs = ProcessScanner.shared.codexRemoteStatus()
-    print("Codex 远程 \(rs.host): \(rs.ok ? "已连上" : "未连上") · \(rs.ageSeconds)s 前拉取")
+    print(rs.hosts.isEmpty ? "Codex 远程：未配置" : "Codex 远程 \(rs.hosts.joined(separator: ", ")): \(rs.ok ? "已连上" : "未连上") · \(rs.ageSeconds)s 前拉取")
     let a = r.api
     let cov = a.coverage
     print("--- 记账覆盖 \(cov.proxiedCount)/\(cov.entries.count) 处走代理 ---")
@@ -463,7 +1063,7 @@ if CommandLine.arguments.contains("--selftest") {
         print("  \(p.provider) [\(p.host)] 今日 \(p.calls) 次 ctx \(p.ctx) cache \(p.cacheRead) out \(p.out) think \(p.think) 模型 \(p.models.joined(separator: ",")) \(p.plan) \(p.balanceText) \(p.fiveHour.map { "5H \($0.usedPct)%" } ?? "") \(p.sevenDay.map { "W \($0.usedPct)%" } ?? "") \(p.monthly.map { "M \($0.usedPct)%" } ?? "") \(p.quotaError)")
         print(String(format: "    延迟 p50 %@ p95 %@ 最慢 %@ · 错误 %d(%.1f%%) 429 %d · 花费 %@ · key %@",
                      Fmt.ms(p.p50ms), Fmt.ms(p.p95ms), Fmt.ms(p.maxms), p.errors, p.errorRate, p.count429,
-                     p.cost.map { String(format: "%.4f %@", $0, p.costCurrency) } ?? "—",
+                     p.cost.isEmpty ? "—" : Fmt.money(p.cost),
                      p.keys.map { "\($0.fingerprint):\($0.calls)" }.joined(separator: " ")))
         if let hw = p.headerWindow { print("    限流头: \(p.headerLabel) 已用 \(hw.usedPct)% 重置 \(Fmt.countdown(to: hw.resetsAt, now: now) ?? "?")") }
         if p.quotaIsEstimate { print("    额度=估算 · \(p.estimateNote) · 上限 \(p.planLimitText)") }
@@ -526,12 +1126,25 @@ if CommandLine.arguments.contains("--selftest") {
     print("已处理 \(history.processedFiles)/\(history.totalFiles) 文件 · 自 \(history.earliestDate ?? "查不到最早日期") · \(history.activeDays) 个活跃日")
     print("累计 token \(history.tokenTotal) · 输入 \(history.ctx) · 缓存读 \(history.cacheRead) · 输出 \(history.aggregate.out)")
     print("缓存命中率 " + (history.cacheHitRate.map { String(format: "%.2f%%", $0 * 100) } ?? "查不到：无输入用量"))
-    for source in ["Claude", "Codex"] {
+    for source in ["Claude", "Codex", "OpenCode"] {
         if let total = history.totals[source] { print("\(source): \(total.tokenTotal) token · \(total.turns) 请求 · \(total.sessions) 会话") }
         else { print("\(source): 未检测到有效用量记录") }
     }
+    for source in history.totals.keys.filter({ $0.hasPrefix("OpenCode · ") }).sorted() {
+        if let total = history.totals[source] { print("\(source): \(total.tokenTotal) token · \(total.turns) 请求 · \(total.sessions) 会话") }
+    }
     print("API 上游 \(history.totals.keys.filter { $0.hasPrefix("API · ") }.count) 个 · 累计差口径 \(history.cumulativeTurns) 次 · 跳过不完整记录 \(history.skippedRecords) 条")
-    print("API 等价成本: " + (history.hasPriceTable ? (history.cost.map { String(format: "%.4f %@", $0, history.priceCurrency) } ?? "未定价") + (history.unpricedModels > 0 ? " · 部分模型未定价" : "") : "未配置价目表"))
+    print("API 等价成本: " + (history.hasAnyPricing ? (history.costByCurrency.isEmpty ? "未定价" : Fmt.money(history.costByCurrency)) + (history.unpricedModels > 0 ? " · 未定价：\(history.unpricedNames.prefix(6).joined(separator: ", "))" : "") : "未配置价目表"))
+    if let f = history.forecast {
+        print(String(format: "预测(%@): 今天 %.2f → 预计 %.2f [%.2f, %.2f] · 近1h %.2f · 本月 %.2f → 预计 %.2f · %@", f.currency, f.todaySoFar, f.todayProjected, f.todayLow, f.todayHigh, f.lastHourCost, f.monthSoFar, f.monthProjected, f.basis))
+    }
+    for (source, t) in history.todayBySource.sorted(by: { $0.key < $1.key }) {
+        print("  今日 \(source): \(t.turns) 次 · \(Fmt.tokens(t.tokenTotal)) token · " + Fmt.money(history.todayCostBySource[source] ?? [:]))
+    }
+    if let b = history.claudeBlock { print(String(format: "Claude 5h 块: %.2f · %.2f/h · 预计 %.2f · active=%d", b.cost, b.perHour, b.projected, b.isActive ? 1 : 0)) }
+    let health = NerfDetector.shared.refreshNow(history: history)
+    print("降智检测: \(health.status) · \(health.headline) · 会话 \(health.sessionsScanned) 轮 \(health.turnsScanned) · 当前 \(health.currentModels)")
+    for f in health.findings.prefix(8) { print("  [\(f.severity)] \(f.source) \(f.title) · \(f.detail) · \(f.session)") }
     if !history.error.isEmpty { print("汇总说明：\(history.error)") }
     print("新增纯函数、Tab 迁移和增量缓存自测通过")
     exit(0)

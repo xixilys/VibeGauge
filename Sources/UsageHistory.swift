@@ -3,6 +3,14 @@ import CryptoKit
 import os
 
 /// 只缓存用量字段，不保存对话正文；按文件保留贡献，才能在日志重写后撤销旧账。
+///
+/// 口径（对齐 ccusage 的做法）：
+/// · Claude：同一 requestId 在日志里会写多行（流式分块），取 token 最多的那条；跨文件再去重（--fork-session 会复制历史）。
+///   `cache_creation.ephemeral_1h_input_tokens` 单独记，1 小时缓存写入按 2× 输入价算；`usage.speed == "fast"` 记为 fast 档。
+/// · Codex：新版每次请求写一条 `token_usage_record`（带 response_id，天然去重）；旧版回退到 `token_count`
+///   的 `last_token_usage`（累计值没前进就不算）。`thread_settings_applied.service_tier` 记下 priority/fast 档。
+///   同一个 rollout 文件出现在 sessions/ 和 archived_sessions/ 里只算一次。
+/// · 远程主机：ssh 跑采集脚本拿逐条记录（Claude / Codex / opencode），挂载目录（如 WSL 的家目录）当成另一台设备直接读。
 public final class UsageHistory {
     public static let shared = UsageHistory()
 
@@ -31,6 +39,7 @@ public final class UsageHistory {
         public var tokenTotal: Int64 { ctx + out }
         public var newInput: Int64 { max(0, ctx - cacheRead - cacheWrite) }
         public var cacheTotal: Int64 { cacheRead + cacheWrite }
+        public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100 : 0 }
 
         mutating func add(_ record: Record) {
             let u = record.usage
@@ -40,7 +49,7 @@ public final class UsageHistory {
         }
         mutating func merge(_ other: Totals) {
             ctx += other.ctx; cacheRead += other.cacheRead; cacheWrite += other.cacheWrite
-            out += other.out; think += other.think; turns += other.turns
+            out += other.out; think += other.think; turns += other.turns; sessions += other.sessions
             for (model, usage) in other.models { models[model, default: ModelTotals()].add(usage) }
         }
     }
@@ -64,13 +73,33 @@ public final class UsageHistory {
         public var totalFiles = 0
         public var error = ""
         public var sourceNotes: [String: String] = [:]
+        /// 用户自己配了 prices.json（手填或 models.dev 同步）
         public var hasPriceTable = false
         public var priceCurrency = ""
-        public var cost: Double?
-        public var costBySource: [String: Double] = [:]
+        /// 内置官方价的日期（空 = 内置价读不到）
+        public var builtinPriceAsOf = ""
+        public var hasAnyPricing: Bool { hasPriceTable || !builtinPriceAsOf.isEmpty }
+        /// 按币种分桶：国产模型 ¥、外国模型 $，不做汇率换算，各显各的
+        public var costByCurrency: [String: Double] = [:]
+        public var costBySource: [String: [String: Double]] = [:]
+        public var costByModel: [String: [String: Double]] = [:]
+        public var todayCostBySource: [String: [String: Double]] = [:]
+        public var todayBySource: [String: Totals] = [:]
+        /// 每日花费（主币种），给热力图 tooltip / 柱状图
+        public var dailyCost: [String: Double] = [:]
+        public var primaryCurrency = "USD"
+        public var forecasts: [String: CostForecast] = [:]
+        /// 设备作用域 → 币种 → 预测；键为 local / remote:<host>，不把其他设备的曲线带入筛选页。
+        public var forecastsByDevice: [String: [String: CostForecast]] = [:]
+        public var dailyCostByDevice: [String: [String: [String: Double]]] = [:]
+        public var forecast: CostForecast? { forecasts[primaryCurrency] }
+        public var claudeBlock: BillingBlock?
         public var unpricedModels = 0
         public var unpricedBySource: [String: Int] = [:]
+        public var unpricedNames: [String] = []
+        public var unpricedNamesBySource: [String: [String]] = [:]
         public var cumulativeTurns = 0
+        public var replayedTurns = 0
         public var skippedRecords = 0
         public var capturedAt: TimeInterval = 0
         public var tokenTotal: Int64 { aggregate.tokenTotal }
@@ -78,10 +107,31 @@ public final class UsageHistory {
         public var cacheRead: Int64 { aggregate.cacheRead }
         public var cacheHitRate: Double? { ctx > 0 ? Double(cacheRead) / Double(ctx) : nil }
         public init() {}
+
+        /// 零点后的下一次扫描前，不把昨日缓存继续显示成今日用量。
+        public func currentDaySources(at now: TimeInterval = Date().timeIntervalSince1970,
+                                      timeZone: TimeZone = .current) -> [String: Totals] {
+            guard capturedAt > 0,
+                  UsageHistory.dayKey(timestamp: capturedAt, timeZone: timeZone) == UsageHistory.dayKey(timestamp: now, timeZone: timeZone)
+            else { return [:] }
+            return todayBySource
+        }
     }
 
     /// 经记账代理的上游（"API · GLM" 这类）：同一请求多半已在 CLI 日志里，不进总数
     public static func isProxySource(_ source: String) -> Bool { source.hasPrefix("API") }
+
+    /// 来源属于哪台设备：`X · <设备>` 的后缀；本机来源没有后缀（API 记账也算本机）。
+    public static func device(of source: String) -> String? {
+        guard !isProxySource(source), let r = source.range(of: " · ", options: .backwards) else { return nil }
+        return String(source[r.upperBound...])
+    }
+
+    /// 来源的 CLI 名（去掉设备后缀）。
+    public static func cli(of source: String) -> String {
+        guard !isProxySource(source), let r = source.range(of: " · ", options: .backwards) else { return source }
+        return String(source[..<r.lowerBound])
+    }
 
     /// 同值同档，零日留空；档位只由非零日的最近秩分位数决定。
     public static func levels(_ values: [Int64]) -> [Int] {
@@ -135,20 +185,30 @@ public final class UsageHistory {
         var model: String
         var usage: ModelTotals
         var cumulative = false
+        /// 多会话来源（opencode / 远程）的会话键。nil 时沿用旧口径：按日志文件路径计会话。
+        /// 必须是可选：老缓存里没有这个键，可选字段才能被 decodeIfPresent 兼容，不必升版本丢历史。
+        var session: String? = nil
+        /// 1 小时缓存写入（已含在 usage.cacheWrite 里），单独计价。
+        var cw1h: Int64? = nil
+        /// 服务档：Codex "priority"/"fast"、Claude "fast"；nil = 标准。
+        var tier: String? = nil
     }
 
-    /// 文件内同 requestId 后写覆盖前写，跨文件再选 timestamp 最新的，和即时扫描器口径一致。
+    /// 文件内同 requestId 取 token 最多的那条（流式分块会先写一个不完整的 usage），跨文件同理。
     static func deduplicateClaude(_ files: [String: [Record]]) -> [String: Record] {
         var result: [String: Record] = [:]
         for path in files.keys.sorted() {
-            var latest: [String: Record] = [:]
-            for record in files[path] ?? [] { latest[record.id] = record }
-            for (id, record) in latest {
-                if let old = result[id], old.timestamp >= record.timestamp { continue }
-                result[id] = record
+            for record in files[path] ?? [] {
+                if let old = result[record.id], !prefer(record, over: old) { continue }
+                result[record.id] = record
             }
         }
         return result
+    }
+
+    static func prefer(_ candidate: Record, over existing: Record) -> Bool {
+        if candidate.usage.tokenTotal != existing.usage.tokenTotal { return candidate.usage.tokenTotal > existing.usage.tokenTotal }
+        return candidate.timestamp > existing.timestamp
     }
 
     private struct FileState: Codable {
@@ -161,12 +221,36 @@ public final class UsageHistory {
         var previousTotal: [String: Int64]?
         var records: [String: Record] = [:]
         var skipped = 0
+        /// 远程来源专用：上次拉到的最大 time_updated / 文件 mtime（毫秒），下次只拉比它更新的。
+        var cursor: Int64? = nil
+        /// 远程来源专用：上次全量拉取时刻；超过一天就强制全量，把远端删掉的会话清出去。
+        var fullAt: TimeInterval? = nil
+        // ---- 以下为 parser 2 新增，全部可选，老缓存照样能解 ----
+        var tier: String? = nil
+        var hasUsageRecords: Bool? = nil
+        var forked: Bool? = nil
+        var burstLast: TimeInterval? = nil
+        var burstFirstId: String? = nil
+        var burstDone: Bool? = nil
+        var replayed: Int? = nil
     }
     private struct DiskCache: Codable {
         var version = 3
         var files: [String: FileState] = [:]
         var days: [Day] = []
         var updatedAt: TimeInterval = 0
+        /// 解析器版本：升级后仍在磁盘上的日志重解析一次（已删除日志的历史保留）。
+        var parser: Int? = nil
+    }
+    private static let parserVersion = 2
+
+    private enum Kind { case claude, codex, opencode, api, remote }
+    private static func kind(of source: String) -> Kind {
+        if source.hasPrefix("Claude") { return .claude }
+        if source.hasPrefix("Codex") { return .codex }
+        if source.hasPrefix("OpenCode") { return .opencode }
+        if source.hasPrefix("Remote") { return .remote }
+        return .api
     }
 
     private let lock = NSLock()
@@ -174,6 +258,12 @@ public final class UsageHistory {
     private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "usage-history")
     private let home: String
     private let cachePath: String
+    private let opencodeDB: String
+    private let catalogOverride: PricingCatalog.Catalog?
+    private var remoteStatus: [String: Bool] = [:]
+    private var remoteError: [String: String] = [:]
+    private var remoteCLIStatus: [String: String] = [:]
+    private var remotePulledAt: [String: TimeInterval] = [:]
     private var timer: DispatchSourceTimer?
     private var started = false
     private var loaded = false
@@ -185,15 +275,21 @@ public final class UsageHistory {
     private var dirty = false
     private var savedAt: TimeInterval = 0
     private static let saveEvery: TimeInterval = 1800
+    private static let scanEvery: TimeInterval = 120
+    private static let remoteEvery: TimeInterval = 300
     private let iso = ISO8601DateFormatter()
     private let isoPlain = ISO8601DateFormatter()
     private static let tokenKeys = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens"]
     private static let usageMarker = Data("\"usage\"".utf8)
-    private static let codexMarkers = ["\"token_count\"", "\"turn_context\"", "\"session_meta\""].map { Data($0.utf8) }
+    private static let codexMarkers = ["\"token_count\"", "\"turn_context\"", "\"session_meta\"", "\"token_usage_record\"", "\"thread_settings_applied\""].map { Data($0.utf8) }
 
-    public init(home: String = FileManager.default.homeDirectoryForCurrentUser.path, cachePath: String? = nil) {
+    /// `opencodeDB` / `catalog` 只在自测里注入：真实路径按 XDG 规则算，内置价随 bundle 分发。
+    public init(home: String = FileManager.default.homeDirectoryForCurrentUser.path, cachePath: String? = nil, opencodeDB: String? = nil,
+                catalog: PricingCatalog.Catalog? = nil) {
         self.home = home
         self.cachePath = cachePath ?? "\(home)/.config/vibegauge/usage-daily.json"
+        self.opencodeDB = opencodeDB ?? OpenCodeUsage.databasePath(home: home)
+        self.catalogOverride = catalog
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         isoPlain.formatOptions = [.withInternetDateTime]
     }
@@ -206,7 +302,7 @@ public final class UsageHistory {
         worker.async { [weak self] in
             guard let self else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.worker)
-            timer.schedule(deadline: .now(), repeating: 300)
+            timer.schedule(deadline: .now(), repeating: Self.scanEvery)
             timer.setEventHandler { [weak self] in self?.scan() }
             self.timer = timer
             timer.resume()
@@ -219,61 +315,225 @@ public final class UsageHistory {
         return cached
     }
 
-    /// 自测的临时日志树也走真实增量路径，和定时扫描共用串行队列。
-    func scanNowForTesting() { worker.sync { scan() } }
+    /// 立即重扫一次（价格表更新后刷新成本时用）。
+    public func refreshNow() { worker.sync { scan() } }
 
-    private func scan() {
+    /// 后台排队重扫（面板上的「刷新」按钮，不阻塞主线程）。
+    public func refreshSoon() { worker.async { [weak self] in self?.scan(forceRemote: true) } }
+
+    func scanNowForTesting() { refreshNow() }
+
+    // MARK: - 设备
+
+    /// 挂载目录：`defaults write com.haifeng.vibegauge mountRoots "wsl=/Volumes/wsl/home/me; lab=/Volumes/lab/home/me"`。
+    /// 每一项是另一台机器的家目录（里面有 .claude / .codex），标签就是面板里的设备名。
+    public static func mountRoots(defaults: UserDefaults = .standard) -> [(label: String, path: String)] {
+        guard let raw = defaults.string(forKey: "mountRoots") else { return [] }
+        return parseMountRoots(raw)
+    }
+
+    public static func parseMountRoots(_ raw: String) -> [(label: String, path: String)] {
+        var out: [(label: String, path: String)] = []
+        var seen = Set<String>()
+        for item in raw.split(whereSeparator: { ";\n,".contains($0) }) {
+            let text = item.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { continue }
+            var label: String, path: String
+            if let eq = text.firstIndex(of: "=") {
+                label = String(text[..<eq]).trimmingCharacters(in: .whitespaces)
+                path = String(text[text.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            } else {
+                path = text
+                label = URL(fileURLWithPath: text).lastPathComponent
+            }
+            path = (path as NSString).expandingTildeInPath
+            guard path.hasPrefix("/"), label.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"#, options: .regularExpression) != nil,
+                  seen.insert(label).inserted else { continue }
+            out.append((label: label, path: path))
+        }
+        return out
+    }
+
+    // MARK: - 扫描
+
+    private func scan(forceRemote: Bool = false) {
         errors = []
         publishProgress(0, total: 0)
         loadCache()
         let paths = discoverFiles()
-        publishProgress(0, total: paths.count)
+        let hosts = RemoteCollector.hosts()
+        let now = Date().timeIntervalSince1970
+        let refreshHosts = CommandLine.arguments.contains("--selftest") ? [] : hosts.filter {
+            forceRemote || now - (remotePulledAt[$0] ?? 0) >= Self.remoteEvery
+        }
+        let units = paths.count + 1 + hosts.count
+        publishProgress(0, total: units)
         for (index, item) in paths.enumerated() {
             autoreleasepool { process(item.path, source: item.source) }
-            publishProgress(index + 1, total: paths.count)
+            publishProgress(index + 1, total: units)
         }
-        var result = summarize()
-        result.processedFiles = paths.count
-        result.totalFiles = paths.count
-        for source in ["Claude", "Codex"] where !paths.contains(where: { $0.source == source }) {
-            result.sourceNotes[source] = result.totals[source] == nil ? "未检测到本机会话日志" : "日志已移除，显示已缓存历史"
+        ingestOpenCode()
+        publishProgress(paths.count + 1, total: units)
+        // SSH 冷扫描可能很慢；先让本机的新数据可见，远端仍保留上次记录。
+        // 两次汇总都在同一个 worker 上，快照交换以外不持锁。
+        if !refreshHosts.isEmpty {
+            publish(makeSnapshot(paths: paths, hosts: hosts, processed: paths.count + 1, total: units,
+                                 refreshingHosts: Set(refreshHosts), isScanning: true))
+            ingestRemote(hosts: refreshHosts)
         }
+        var result = makeSnapshot(paths: paths, hosts: hosts, processed: units, total: units)
         cache.days = result.days
-        cache.updatedAt = Date().timeIntervalSince1970
+        cache.updatedAt = result.capturedAt
         if dirty, cache.updatedAt - savedAt >= Self.saveEvery {
             saveCache()
             dirty = false
             savedAt = cache.updatedAt
         }
-        result.capturedAt = cache.updatedAt
         result.error = errors.sorted().joined(separator: "；")
+        publish(result)
+        log.notice("历史汇总完成：\(paths.count) 文件，\(result.days.count) 天，跳过 \(result.skippedRecords) 条不完整记录")
+    }
+
+    private func makeSnapshot(paths: [(path: String, source: String)], hosts: [String], processed: Int, total: Int,
+                              refreshingHosts: Set<String> = [], isScanning: Bool = false) -> Snapshot {
+        var result = summarize()
+        result.isScanning = isScanning
+        result.processedFiles = processed
+        result.totalFiles = total
+        for source in ["Claude", "Codex"] where !paths.contains(where: { $0.source == source }) {
+            result.sourceNotes[source] = result.totals[source] == nil ? "未检测到本机会话日志" : "日志已移除，显示已缓存历史"
+        }
+        if result.totals["OpenCode"] == nil {
+            result.sourceNotes["OpenCode"] = FileManager.default.fileExists(atPath: opencodeDB) ? "未检测到 opencode 用量记录" : "未检测到 opencode 数据库"
+        }
+        for host in hosts {
+            for cli in ["OpenCode", "Codex", "Claude"] {
+                let source = "\(cli) · \(host)"
+                let reason = cli == "OpenCode" ? (remoteStatus[host] == false ? remoteError[host] : nil) : remoteCLIStatus[host]
+                result.sourceNotes[source] = Self.remoteSourceNote(cli: cli, hasHistory: result.totals[source] != nil,
+                                                                   isRefreshing: refreshingHosts.contains(host), failure: reason)
+            }
+        }
+        for root in Self.mountRoots() where !FileManager.default.fileExists(atPath: root.path) {
+            result.sourceNotes["Claude · \(root.label)"] = "挂载目录不在：\(root.path)"
+            result.sourceNotes["Codex · \(root.label)"] = "挂载目录不在：\(root.path)"
+        }
+        result.capturedAt = Date().timeIntervalSince1970
+        result.error = errors.sorted().joined(separator: "；")
+        return result
+    }
+
+    /// 拉取失败时，已有记录也必须说明是保留的历史，不能被本机刷新时间掩盖。
+    static func remoteSourceNote(cli: String, hasHistory: Bool, isRefreshing: Bool, failure: String?) -> String? {
+        if isRefreshing {
+            return hasHistory ? L("正在刷新远端日志，显示已缓存历史", "Refreshing remote logs; showing retained history")
+                              : L("正在读取远端日志", "Reading remote logs")
+        }
+        if let failure {
+            return hasHistory ? L("远端日志刷新失败（\(failure)），显示已缓存历史", "Remote refresh failed (\(failure)); showing retained history")
+                              : L("未连上（\(failure)）", "Unavailable (\(failure))")
+        }
+        return hasHistory ? nil : L("远端无 \(cli) 记录", "No remote \(cli) records")
+    }
+
+    private func publish(_ result: Snapshot) {
         lock.lock()
         let old = cached
         cached = result
         lock.unlock()
         withExtendedLifetime(old) {}
-        log.notice("历史汇总完成：\(paths.count) 文件，\(result.days.count) 天，跳过 \(result.skippedRecords) 条不完整记录")
     }
 
     private func discoverFiles() -> [(path: String, source: String)] {
         let fm = FileManager.default
         var result: [(path: String, source: String)] = []
-        for (suffix, source) in [(".claude/projects", "Claude"), (".codex/sessions", "Codex")] {
-            let root = URL(fileURLWithPath: "\(home)/\(suffix)")
-            guard fm.fileExists(atPath: root.path) else { continue }
-            guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], errorHandler: { _, _ in
-                self.errors.insert("部分日志目录无法读取，汇总可能不完整")
-                return true
-            }) else { errors.insert("日志目录无法读取"); continue }
-            for case let url as URL in en where url.pathExtension == "jsonl" {
-                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                      values.isRegularFile == true, values.isSymbolicLink != true else { continue }
-                result.append((url.path, source))
+        var roots: [(suffix: String, home: String)] = [("", home)]
+        // 自测的临时 home 不读真实挂载目录
+        if home == FileManager.default.homeDirectoryForCurrentUser.path {
+            roots += Self.mountRoots().map { (suffix: " · \($0.label)", home: $0.path) }
+        }
+        for root in roots {
+            let dirs: [(String, String)] = [(".claude/projects", "Claude"), (".config/claude/projects", "Claude"),
+                                            (".codex/sessions", "Codex"), (".codex/archived_sessions", "Codex")]
+            for (suffix, cli) in dirs {
+                let base = URL(fileURLWithPath: "\(root.home)/\(suffix)")
+                guard fm.fileExists(atPath: base.path) else { continue }
+                guard let en = fm.enumerator(at: base, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], errorHandler: { _, _ in
+                    self.errors.insert("部分日志目录无法读取，汇总可能不完整")
+                    return true
+                }) else { errors.insert("日志目录无法读取"); continue }
+                for case let url as URL in en where url.pathExtension == "jsonl" {
+                    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                          values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                    result.append((url.path, cli + root.suffix))
+                }
             }
         }
         let api = "\(home)/.config/vibegauge/api-calls.jsonl"
         if fm.fileExists(atPath: api) { result.append((api, "API")) }
         return result.sorted { $0.path < $1.path }
+    }
+
+    /// 本机 opencode：一次 SQL 整表重读后替换这份伪文件的全部记录；读失败保留上次，绝不拿空数据覆盖。
+    private func ingestOpenCode() {
+        guard FileManager.default.fileExists(atPath: opencodeDB) else { return }   // 库不在 → 保留已缓存历史
+        guard let records = OpenCodeUsage.read(dbPath: opencodeDB) else {
+            errors.insert("opencode 用量库暂时读不到，保留上次汇总")
+            return
+        }
+        if records.isEmpty, let cached = cache.files[opencodeDB], !cached.records.isEmpty {
+            errors.insert("opencode 用量库读回 0 条，保留上次汇总")
+            return
+        }
+        cache.files[opencodeDB] = FileState(source: "OpenCode", records: records)
+        dirty = true
+    }
+
+    /// 远程主机：ssh 拉 opencode 增量 + Claude/Codex 逐条记录（按文件 mtime 游标增量）。
+    /// 失败只更新状态、保留该主机上次的记录 —— 和日志被删后仍保留历史是同一个口径。
+    private func ingestRemote(hosts: [String]) {
+        for host in hosts {
+            let now = Date().timeIntervalSince1970
+            remotePulledAt[host] = now
+            let key = "remote://\(host)"
+            var state = cache.files[key] ?? FileState(source: "OpenCode · \(host)")
+            let full = state.fullAt == nil || now - (state.fullAt ?? 0) >= 86400
+            switch RemoteCollector.pullUsage(host: host, since: full ? 0 : (state.cursor ?? 0)) {
+            case .failure(let error):
+                remoteStatus[host] = false
+                remoteError[host] = error.message
+                if full { state.fullAt = now; cache.files[key] = state; dirty = true }
+            case .success(let pull):
+                remoteStatus[host] = true
+                remoteError[host] = nil
+                state.source = "OpenCode · \(host)"
+                if full { state.records = [:] }
+                for record in pull.records { state.records[record.id] = record }
+                if pull.maxUpdated > 0 { state.cursor = max(state.cursor ?? 0, pull.maxUpdated) }
+                if full { state.fullAt = now }
+                cache.files[key] = state
+                dirty = true
+            }
+            // Claude / Codex 逐条：只拉 mtime 比游标新的文件（留 10 分钟余量），记录按 id 覆盖。
+            let cliKey = "remote-cli://\(host)"
+            var cli = cache.files[cliKey] ?? FileState(source: "Remote · \(host)")
+            let since = max(0, (cli.cursor ?? 0) - 600_000)
+            switch RemoteCollector.pullCLIRecords(host: host, since: since) {
+            case .failure(let error):
+                remoteCLIStatus[host] = error.message
+                log.notice("remote cli \(host, privacy: .public) 未连上：\(error.message, privacy: .public)")
+            case .success(let pull):
+                remoteCLIStatus[host] = nil
+                for record in pull.records {
+                    if let old = cli.records[record.id], Self.kind(of: record.source) == .claude, !Self.prefer(record, over: old) { continue }
+                    cli.records[record.id] = record
+                }
+                if pull.maxMtime > 0 { cli.cursor = max(cli.cursor ?? 0, pull.maxMtime) }
+                cache.files[cliKey] = cli
+                dirty = true
+                log.notice("remote cli \(host, privacy: .public) 收到 \(pull.records.count) 条")
+            }
+        }
     }
 
     private func process(_ path: String, source: String) {
@@ -319,49 +579,114 @@ public final class UsageHistory {
     }
 
     private func consume(_ data: Data, offset: UInt64, state: inout FileState) {
+        let kind = Self.kind(of: state.source)
         // 大多数行是工具结果和正文，先筛字段名，避免把数 GB 无关 JSON 全部解码。
-        if state.source == "Claude", data.range(of: Self.usageMarker) == nil { return }
-        if state.source == "Codex", !Self.codexMarkers.contains(where: { data.range(of: $0) != nil }) { return }
+        if kind == .claude, data.range(of: Self.usageMarker) == nil { return }
+        if kind == .codex, !Self.codexMarkers.contains(where: { data.range(of: $0) != nil }) { return }
         guard !data.isEmpty else { return }
         guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { state.skipped += 1; return }
-        if state.source == "Claude" {
-            guard j["type"] as? String == "assistant", let msg = j["message"] as? [String: Any],
-                  let usage = msg["usage"] as? [String: Any] else { return }
-            let model = msg["model"] as? String ?? "?"
-            guard !model.contains("synthetic") else { return }
-            guard let ts = timestamp(j["timestamp"]),
-                  let id = (j["requestId"] as? String) ?? (msg["id"] as? String) ?? (j["uuid"] as? String), !id.isEmpty,
-                  let input = number(usage["input_tokens"]), let output = number(usage["output_tokens"]) else { state.skipped += 1; return }
-            let read = number(usage["cache_read_input_tokens"]) ?? 0
-            let write = number(usage["cache_creation_input_tokens"]) ?? 0
-            let think = number((usage["output_tokens_details"] as? [String: Any])?["thinking_tokens"]) ?? 0
-            state.records[id] = Record(id: id, source: "Claude", timestamp: ts, model: model.isEmpty ? "?" : model,
-                                       usage: ModelTotals(ctx: input + read + write, cacheRead: read, cacheWrite: write, out: output, think: think))
-        } else if state.source == "Codex" {
-            guard let payload = j["payload"] as? [String: Any] else { return }
-            if ["turn_context", "session_meta"].contains(j["type"] as? String ?? "") {
-                if let model = payload["model"] as? String, !model.isEmpty { state.model = model }
-                return
-            }
-            guard j["type"] as? String == "event_msg", payload["type"] as? String == "token_count", let info = payload["info"] as? [String: Any] else { return }
-            guard let parsed = Self.codexUsage(info: info, previous: &state.previousTotal) else { return }
-            guard let ts = timestamp(j["timestamp"]) else { state.skipped += 1; return }
-            let model = (payload["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? state.model
-            let id = String(offset)
-            state.records[id] = Record(id: id, source: "Codex", timestamp: ts, model: model, usage: parsed.usage, cumulative: parsed.cumulative)
-        } else {
-            guard let ts = timestamp(j["epoch"]) ?? timestamp(j["ts"]), let host = j["host"] as? String,
-                  let ctx = number(j["ctx"]), let out = number(j["out"]) else { state.skipped += 1; return }
-            let provider = (j["provider"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? host
-            let model = (j["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?"
-            let id = String(offset)
-            state.records[id] = Record(id: id, source: "API · " + provider, timestamp: ts, model: model,
-                                       usage: ModelTotals(ctx: ctx, cacheRead: number(j["cache_read"]) ?? 0,
-                                                          cacheWrite: number(j["cache_write"]) ?? 0, out: out, think: number(j["think"]) ?? 0))
+        switch kind {
+        case .claude: consumeClaude(j, state: &state)
+        case .codex: consumeCodex(j, offset: offset, state: &state)
+        default: consumeAPI(j, offset: offset, state: &state)
         }
     }
 
-    private static func tokenFields(_ raw: Any?) -> [String: Int64]? {
+    private func consumeClaude(_ line: [String: Any], state: inout FileState) {
+        // 子代理进度行把一条完整的 assistant 记录包在 data.message 里
+        var entry = line
+        if entry["message"] == nil || (entry["type"] as? String) != "assistant",
+           let inner = (line["data"] as? [String: Any])?["message"] as? [String: Any], inner["message"] is [String: Any] {
+            entry = inner
+            if entry["type"] == nil { entry["type"] = "assistant" }
+        }
+        guard entry["type"] as? String == "assistant", let msg = entry["message"] as? [String: Any],
+              let usage = msg["usage"] as? [String: Any] else { return }
+        if entry["isApiErrorMessage"] as? Bool == true { return }
+        let model = msg["model"] as? String ?? "?"
+        guard !model.contains("synthetic") else { return }
+        guard let ts = timestamp(entry["timestamp"]),
+              let id = (entry["requestId"] as? String) ?? (msg["id"] as? String) ?? (entry["uuid"] as? String), !id.isEmpty,
+              let input = number(usage["input_tokens"]), let output = number(usage["output_tokens"]) else { state.skipped += 1; return }
+        let read = number(usage["cache_read_input_tokens"]) ?? 0
+        let write = number(usage["cache_creation_input_tokens"]) ?? 0
+        let w1h = min(write, number((usage["cache_creation"] as? [String: Any])?["ephemeral_1h_input_tokens"]) ?? 0)
+        let think = number((usage["output_tokens_details"] as? [String: Any])?["thinking_tokens"]) ?? 0
+        let tier = (usage["speed"] as? String)?.lowercased() == "fast" ? "fast" : nil
+        let record = Record(id: id, source: state.source, timestamp: ts, model: model.isEmpty ? "?" : model,
+                            usage: ModelTotals(ctx: input + read + write, cacheRead: read, cacheWrite: write, out: output, think: think),
+                            cw1h: w1h > 0 ? w1h : nil, tier: tier)
+        if let old = state.records[id], !Self.prefer(record, over: old) { return }
+        state.records[id] = record
+    }
+
+    private func consumeCodex(_ j: [String: Any], offset: UInt64, state: inout FileState) {
+        guard let payload = j["payload"] as? [String: Any] else { return }
+        let type = j["type"] as? String ?? ""
+        switch type {
+        case "session_meta":
+            if let fork = payload["forked_from_id"] as? String, !fork.isEmpty { state.forked = true }
+            if let model = payload["model"] as? String, !model.isEmpty { state.model = model }
+        case "turn_context":
+            if let model = payload["model"] as? String, !model.isEmpty { state.model = model }
+        case "token_usage_record":
+            guard let fields = Self.tokenFields(payload["usage"]), let ts = timestamp(j["timestamp"]) else { state.skipped += 1; return }
+            if state.hasUsageRecords != true {
+                // 这个文件有逐请求记录：此前从 token_count 推出来的记录作废，避免两套口径叠加
+                state.hasUsageRecords = true
+                state.records = state.records.filter { $0.key.hasPrefix("resp") }
+            }
+            let usage = Self.codexLastTokenUsage(fields)
+            guard usage.tokenTotal > 0 else { return }
+            let id = (payload["response_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "resp-off-\(offset)"
+            state.records[id] = Record(id: id, source: state.source, timestamp: ts, model: state.model, usage: usage,
+                                       session: nil, tier: state.tier)
+        case "event_msg":
+            let ptype = payload["type"] as? String ?? ""
+            if ptype == "thread_settings_applied" {
+                if let tier = (payload["thread_settings"] as? [String: Any])?["service_tier"] as? String { state.tier = tier.lowercased() }
+                return
+            }
+            guard ptype == "token_count", let info = payload["info"] as? [String: Any] else { return }
+            guard let parsed = Self.codexUsage(info: info, previous: &state.previousTotal) else { return }
+            guard state.hasUsageRecords != true else { return }
+            guard let ts = timestamp(j["timestamp"]) else { state.skipped += 1; return }
+            let id = String(offset)
+            // 旧版 fork 会把父会话的用量按同一秒重放一遍：开头连续 1 秒内的一串只当基线
+            if state.forked == true, state.burstDone != true {
+                if let last = state.burstLast {
+                    if ts - last <= 1.0 {
+                        if let first = state.burstFirstId { state.records[first] = nil; state.burstFirstId = nil; state.replayed = (state.replayed ?? 0) + 1 }
+                        state.burstLast = ts
+                        state.replayed = (state.replayed ?? 0) + 1
+                        return
+                    }
+                    state.burstDone = true
+                } else {
+                    state.burstLast = ts
+                    state.burstFirstId = id
+                }
+            }
+            let model = (payload["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? state.model
+            state.records[id] = Record(id: id, source: state.source, timestamp: ts, model: model, usage: parsed.usage,
+                                       cumulative: parsed.cumulative, tier: state.tier)
+        default:
+            return
+        }
+    }
+
+    private func consumeAPI(_ j: [String: Any], offset: UInt64, state: inout FileState) {
+        guard let ts = timestamp(j["epoch"]) ?? timestamp(j["ts"]), let host = j["host"] as? String,
+              let ctx = number(j["ctx"]), let out = number(j["out"]) else { state.skipped += 1; return }
+        let provider = (j["provider"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? host
+        let model = (j["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?"
+        let id = String(offset)
+        state.records[id] = Record(id: id, source: "API · " + provider, timestamp: ts, model: model,
+                                   usage: ModelTotals(ctx: ctx, cacheRead: number(j["cache_read"]) ?? 0,
+                                                      cacheWrite: number(j["cache_write"]) ?? 0, out: out, think: number(j["think"]) ?? 0))
+    }
+
+    static func tokenFields(_ raw: Any?) -> [String: Int64]? {
         guard let fields = raw as? [String: Any], fields["input_tokens"] is NSNumber, fields["output_tokens"] is NSNumber else { return nil }
         var result: [String: Int64] = [:]
         for key in tokenKeys {
@@ -369,6 +694,10 @@ public final class UsageHistory {
             guard n >= 0 else { return nil }
             result[key] = n
         }
+        // 缓存读不会超过输入、缓存写不会超过剩下的新鲜输入（ccusage 同样夹紧）
+        let input = result["input_tokens"] ?? 0
+        result["cached_input_tokens"] = min(result["cached_input_tokens"] ?? 0, input)
+        result["cache_write_input_tokens"] = min(result["cache_write_input_tokens"] ?? 0, input - (result["cached_input_tokens"] ?? 0))
         return result
     }
     private func number(_ raw: Any?) -> Int64? {
@@ -386,12 +715,22 @@ public final class UsageHistory {
     private func loadCache() {
         guard !loaded else { return }
         loaded = true
-        guard FileManager.default.fileExists(atPath: cachePath) else { return }
+        guard FileManager.default.fileExists(atPath: cachePath) else { cache.parser = Self.parserVersion; return }
         do {
             let decoded = try JSONDecoder().decode(DiskCache.self, from: Data(contentsOf: URL(fileURLWithPath: cachePath)))
             guard decoded.version == 3 else { errors.insert("历史缓存版本变化，已重新汇总"); return }
             cache = decoded
         } catch { errors.insert("历史缓存无法读取，已重新汇总") }
+        if (cache.parser ?? 1) < Self.parserVersion {
+            // 新口径：仍在磁盘上的 Claude / Codex 日志重解析一次；已被清理的日志保留旧账
+            let fm = FileManager.default
+            for (path, state) in cache.files where [.claude, .codex].contains(Self.kind(of: state.source)) && fm.fileExists(atPath: path) {
+                cache.files[path] = nil
+            }
+            cache.parser = Self.parserVersion
+            dirty = true
+            savedAt = 0
+        }
     }
     private func saveCache() {
         do {
@@ -415,25 +754,48 @@ public final class UsageHistory {
         lock.unlock()
     }
 
+    // MARK: - 汇总
+
     private func summarize() -> Snapshot {
         var result = Snapshot()
         var buckets: [String: [String: Totals]] = [:]
         var sessions: [String: Set<String>] = [:]
         var dailySessions: [String: [String: Set<String>]] = [:]
-        var claudeFiles: [String: [Record]] = [:]
+        var claudeFiles: [String: [String: [Record]]] = [:]     // 来源 → 文件 → 记录
         var records: [Record] = []
-        // 旧日志被清理后仍保留历史；同一路径重写时 process 已替换该文件的全部贡献。
+        let fm = FileManager.default
+
+        // 同一 rollout 同时出现在 sessions/ 与 archived_sessions/（或被挪走后旧路径还在缓存里）：只留一份
+        var codexWinner: [String: String] = [:]
+        for (path, state) in cache.files where Self.kind(of: state.source) == .codex {
+            let key = state.source + "|" + (path as NSString).lastPathComponent
+            if let other = codexWinner[key], let o = cache.files[other] {
+                let mine = (fm.fileExists(atPath: path) ? 1 : 0, state.records.count)
+                let theirs = (fm.fileExists(atPath: other) ? 1 : 0, o.records.count)
+                if mine > theirs { codexWinner[key] = path }
+            } else { codexWinner[key] = path }
+        }
+        let codexKeep = Set(codexWinner.values)
+
         for (path, state) in cache.files {
+            let kind = Self.kind(of: state.source)
+            if kind == .codex, !codexKeep.contains(path) { continue }
             result.skippedRecords += state.skipped
-            if state.source == "Claude" { claudeFiles[path] = Array(state.records.values) }
-            else { records.append(contentsOf: state.records.values) }
+            if state.hasUsageRecords != true { result.replayedTurns += state.replayed ?? 0 }
+            if kind == .claude {
+                claudeFiles[state.source, default: [:]][path] = Array(state.records.values)
+            } else {
+                records.append(contentsOf: state.records.values)
+            }
             for record in state.records.values {
                 let day = Self.dayKey(timestamp: record.timestamp)
-                sessions[record.source, default: []].insert(path)
-                dailySessions[day, default: [:]][record.source, default: []].insert(path)
+                let sessionKey = record.session ?? path
+                sessions[record.source, default: []].insert(sessionKey)
+                dailySessions[day, default: [:]][record.source, default: []].insert(sessionKey)
             }
         }
-        records.append(contentsOf: Self.deduplicateClaude(claudeFiles).values)
+        for (_, files) in claudeFiles { records.append(contentsOf: Self.deduplicateClaude(files).values) }
+
         for record in records {
             let day = Self.dayKey(timestamp: record.timestamp)
             buckets[day, default: [:]][record.source, default: Totals()].add(record)
@@ -446,33 +808,115 @@ public final class UsageHistory {
         }
         result.days = buckets.keys.sorted().map { Day(date: $0, sources: buckets[$0]!) }
         result.earliestDate = result.days.first?.date
-        // 经记账代理的 API 调用不计入总数与热力图：代理前面挂的多半就是 Claude Code / Codex，
-        // 同一次请求在 CLI 日志里已经记过一次，再加就是重复计数。API 只单独出卡片。
+        let now = Date()
+        let todayKey = Self.dayKey(timestamp: now.timeIntervalSince1970)
+        result.todayBySource = buckets[todayKey] ?? [:]
+        // 经记账代理的 API 调用不计入总数与热力图：同一次请求在 CLI 日志里已经记过一次。
         func cliTokens(_ d: Day) -> Int64 {
             d.sources.filter { !Self.isProxySource($0.key) }.values.reduce(0) { $0 + $1.tokenTotal }
         }
         result.dailyTokens = Dictionary(uniqueKeysWithValues: result.days.map { ($0.date, cliTokens($0)) })
         result.activeDays = result.dailyTokens.values.filter { $0 > 0 }.count
         for (source, totals) in result.totals where !Self.isProxySource(source) { result.aggregate.merge(totals) }
-        let price = readJSON("\(home)/.config/vibegauge/prices.json").map { ProcessScanner.PriceTable(json: $0) } ?? ProcessScanner.PriceTable()
-        result.hasPriceTable = !price.isEmpty
-        result.priceCurrency = price.currency
-        for (source, totals) in result.totals {
-            for (model, usage) in totals.models {
-                if let cost = price.cost(model: model, ctx: usage.ctx, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, out: usage.out) {
-                    result.cost = (result.cost ?? 0) + cost
-                    result.costBySource[source, default: 0] += cost
-                } else {
-                    result.unpricedModels += 1
-                    result.unpricedBySource[source, default: 0] += 1
+
+        // ---- 成本：用户价目表优先，内置官方价兜底；按每条记录的时间与档位算 ----
+        let userJSON = readJSON("\(home)/.config/vibegauge/prices.json")
+        let user = userJSON.map { ProcessScanner.PriceTable(json: $0) } ?? ProcessScanner.PriceTable()
+        let catalog = catalogOverride ?? PricingCatalog.builtin
+        let engine = CostEngine(user: user, catalog: catalog)
+        result.hasPriceTable = !user.isEmpty
+        result.priceCurrency = user.currency
+        result.builtinPriceAsOf = catalog.isEmpty ? "" : catalog.asOf
+        var priced: [String: Bool] = [:]
+        let horizon = now.timeIntervalSince1970 - 35 * 86400
+        var hourly: [String: [String: [Double]]] = [:]       // 币种 → 日 → 24 小时
+        var lastHour: [String: Double] = [:]
+        var deviceHourly: [String: [String: [String: [Double]]]] = [:]
+        var deviceLastHour: [String: [String: Double]] = [:]
+        var claudePoints: [UsageForecast.Point] = []
+        let hourCal = Calendar.current
+        for record in records {
+            if priced[record.model] == nil { priced[record.model] = engine.isPriced(record.model) }
+            guard priced[record.model] == true,
+                  let c = engine.cost(model: record.model, ctx: record.usage.ctx, cacheRead: record.usage.cacheRead,
+                                      cacheWrite: record.usage.cacheWrite, cacheWrite1h: record.cw1h ?? 0, out: record.usage.out,
+                                      tier: record.tier, at: Date(timeIntervalSince1970: record.timestamp)) else { continue }
+            result.costByCurrency[c.currency, default: 0] += c.value
+            result.costBySource[record.source, default: [:]][c.currency, default: 0] += c.value
+            result.costByModel[record.model, default: [:]][c.currency, default: 0] += c.value
+            let isProxy = Self.isProxySource(record.source)
+            if !isProxy, record.timestamp >= horizon {
+                let day = Self.dayKey(timestamp: record.timestamp)
+                let hour = hourCal.component(.hour, from: Date(timeIntervalSince1970: record.timestamp))
+                if hourly[c.currency]?[day] == nil { hourly[c.currency, default: [:]][day] = Array(repeating: 0, count: 24) }
+                hourly[c.currency]?[day]?[hour] += c.value
+                let device = Self.device(of: record.source).map { "remote:\($0)" } ?? "local"
+                if deviceHourly[device]?[c.currency]?[day] == nil {
+                    deviceHourly[device, default: [:]][c.currency, default: [:]][day] = Array(repeating: 0, count: 24)
+                }
+                deviceHourly[device]?[c.currency]?[day]?[hour] += c.value
+                if day == todayKey { result.todayCostBySource[record.source, default: [:]][c.currency, default: 0] += c.value }
+                if record.timestamp >= now.timeIntervalSince1970 - 3600 {
+                    lastHour[c.currency, default: 0] += c.value
+                    deviceLastHour[device, default: [:]][c.currency, default: 0] += c.value
                 }
             }
+            if record.source == "Claude", c.currency == "USD", record.timestamp >= now.timeIntervalSince1970 - 86400 {
+                claudePoints.append(.init(timestamp: record.timestamp, cost: c.value, tokens: record.usage.tokenTotal))
+            }
         }
+        let cliCost = result.costBySource.filter { !Self.isProxySource($0.key) }
+            .values.reduce(into: [String: Double]()) { acc, v in for (k, x) in v { acc[k, default: 0] += x } }
+        result.primaryCurrency = cliCost.max { $0.value < $1.value }?.key ?? "USD"
+        for (currency, days) in hourly {
+            result.forecasts[currency] = UsageForecast.compute(hourly: days, lastHourCost: lastHour[currency] ?? 0, currency: currency, now: now)
+        }
+        for (device, currencies) in deviceHourly {
+            for (currency, days) in currencies {
+                result.dailyCostByDevice[device, default: [:]][currency] = days.mapValues { $0.reduce(0, +) }
+                result.forecastsByDevice[device, default: [:]][currency] = UsageForecast.compute(
+                    hourly: days, lastHourCost: deviceLastHour[device]?[currency] ?? 0, currency: currency, now: now)
+            }
+        }
+        for (day, hours) in hourly[result.primaryCurrency] ?? [:] { result.dailyCost[day] = hours.reduce(0, +) }
+        if !claudePoints.isEmpty {
+            result.claudeBlock = UsageForecast.currentBlock(claudePoints.sorted { $0.timestamp < $1.timestamp }, currency: "USD",
+                                                            now: now.timeIntervalSince1970)
+        }
+        // 未定价只按「模型」计一次，别按请求数刷屏。
+        var unpricedNames = Set<String>()
+        for (source, totals) in result.totals {
+            for (model, _) in totals.models where !(priced[model] ?? engine.isPriced(model)) {
+                result.unpricedModels += 1
+                result.unpricedBySource[source, default: 0] += 1
+                unpricedNames.insert(model)
+                result.unpricedNamesBySource[source, default: []].append(model)
+            }
+        }
+        result.unpricedNames = unpricedNames.sorted()
+        for key in result.unpricedNamesBySource.keys { result.unpricedNamesBySource[key]?.sort() }
         return result
     }
 }
 
 public extension Fmt {
+    /// 单币种金额："¥12.34" / "$5.67"；不足一分钱显示 "<0.01"；≥ 1 万用千分位。
+    static func money(_ value: Double, _ currency: String) -> String {
+        let symbol = currency == "CNY" ? "¥" : (currency == "USD" ? "$" : (currency.isEmpty ? "" : currency + " "))
+        if value < 0.01 && value > 0 { return "\(symbol)<0.01" }
+        if value >= 10_000 {
+            let f = NumberFormatter(); f.numberStyle = .decimal; f.maximumFractionDigits = 0
+            return symbol + (f.string(from: NSNumber(value: value)) ?? String(format: "%.0f", value))
+        }
+        return String(format: "%@%.2f", symbol, value)
+    }
+
+    /// 多币种并列显示："¥12.34 + $5.67"。不换算汇率 —— 编一个汇率和编一个价格一样糟。
+    static func money(_ byCurrency: [String: Double]) -> String {
+        let parts = byCurrency.keys.sorted().compactMap { key in byCurrency[key].map { money($0, key) } }
+        return parts.isEmpty ? "—" : parts.joined(separator: " + ")
+    }
+
     static func tokens(_ count: Int64) -> String {
         if count >= 100_000_000 { return String(format: "%.2f 亿", Double(count) / 100_000_000) }
         if count >= 10_000 { return String(format: "%.1f 万", Double(count) / 10_000) }
