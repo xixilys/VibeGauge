@@ -289,6 +289,14 @@ public struct DashboardView: View {
         }.values.flatMap { $0 }).count
     }
 
+    private var retainedHistoryNote: String? {
+        let cachedSources = history.sourceNotes.keys.filter {
+            UsageHistory.device(of: $0) != nil && history.totals[$0] != nil &&
+                DeviceScope.includes(source: $0, scope: deviceScope, hosts: report.remoteHosts)
+        }
+        return cachedSources.isEmpty ? nil : L("含远端缓存；刷新状态见统计页", "Includes retained remote history; see Statistics for refresh status")
+    }
+
     /// 与费用采用同一份当日记录，包含归档会话及远程设备。
     private var todayCLICandidates: [CLIUsage] {
         DeviceScope.todayUsage(local: currentCLI, history: history.currentDaySources(), scope: deviceScope,
@@ -889,6 +897,7 @@ public struct DashboardView: View {
                 localAISection.vgCard()
             }
             OverviewStrip(forecasts: scopedForecasts, capturedAt: history.capturedAt, unpricedCount: scopedUnpricedCount,
+                          coverageNote: retainedHistoryNote,
                           openStats: { tab = 2 }, openPrices: openPrices)
         }
     }
@@ -904,7 +913,7 @@ public struct DashboardView: View {
                     Circle()
                         .fill(activeCount > 0 ? Color.green : Color.secondary.opacity(0.4))
                         .frame(width: 5, height: 5)
-                    Text("\(activeCount) 个平台活跃")
+                    Text(L("本机 \(activeCount) 个平台在线", "\(activeCount) local platforms online"))
                         .font(VG.scaled(9.5, weight: .medium))
                         .foregroundColor(.secondary)
                 }
@@ -1039,6 +1048,10 @@ public struct DashboardView: View {
                     Text(L("已采集日志 · 本机与远程设备合计", "Collected logs · local and remote devices combined"))
                         .font(VG.caption).foregroundStyle(.secondary)
                 }
+                if let note = retainedHistoryNote {
+                    Text(note).font(VG.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 // 列表和上方选中的 CLI 使用同一个设备范围。
                 if !isRemoteScope && !todayCLICandidates.isEmpty {
@@ -1172,7 +1185,6 @@ public struct DashboardView: View {
     @ViewBuilder
     private func remoteDeviceSection(host: String) -> some View {
         let today = historyTodayRows(host)
-        let quota = ProcessScanner.shared.remoteQuotaByHost()[host]
         let hostSources = history.totals.filter { UsageHistory.device(of: $0.key) == host }
         let total: UsageHistory.Totals? = hostSources.isEmpty ? nil : hostSources.values.reduce(into: UsageHistory.Totals()) { $0.merge($1) }
         let cost = history.costBySource.filter { UsageHistory.device(of: $0.key) == host }.values
@@ -1184,7 +1196,7 @@ public struct DashboardView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 VGIcon(symbol: "desktopcomputer", tint: .blue)
-                Text("设备 · \(host)").font(VG.headline)
+                Text(L("设备 · \(RemoteCollector.displayName(for: host))", "Device · \(RemoteCollector.displayName(for: host))")).font(VG.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
@@ -1209,18 +1221,11 @@ public struct DashboardView: View {
                 remoteCLIList(today)
             }
 
-            if hasRemoteQuota(quota) {
-                Divider().opacity(0.25)
-                VStack(alignment: .leading, spacing: 5) {
-                    if let q = quota {
-                        if q.codexFiveHour != nil || q.codexWeekly != nil {
-                            remoteQuotaLine(label: "Codex", plan: q.codexPlan, five: q.codexFiveHour, weekly: q.codexWeekly)
-                        }
-                        if q.claudeFiveHour != nil || q.claudeWeekly != nil {
-                            remoteQuotaLine(label: "Claude", plan: "", five: q.claudeFiveHour, weekly: q.claudeWeekly)
-                        }
-                    }
-                }
+            let notes = Array(Set(["Claude", "Codex", "OpenCode"].compactMap { history.sourceNotes["\($0) · \(host)"] })).sorted()
+            if !notes.isEmpty {
+                Text(notes.joined(separator: " · "))
+                    .font(VG.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Text(isMount ? "直接读挂载目录里的 .claude / .codex 日志，口径与本机一致。" : "每 5 分钟经 ssh 增量拉取 Claude / Codex / opencode 的逐条记录，按请求时间归到每一天；成本按内置官方价或你的价目表。")
@@ -1241,11 +1246,6 @@ public struct DashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .vgFill(0.07, radius: 7)
-    }
-
-    private func hasRemoteQuota(_ quota: ProcessScanner.RemoteQuota?) -> Bool {
-        guard let q = quota else { return false }
-        return q.codexFiveHour != nil || q.codexWeekly != nil || q.claudeFiveHour != nil || q.claudeWeekly != nil
     }
 
     /// 远程设备今日各 CLI 一张紧凑卡片：输入、输出、次数和缓存命中率。
@@ -1282,29 +1282,6 @@ public struct DashboardView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .vgFill(0.06, radius: 6)
-            }
-        }
-    }
-
-    /// 远程额度一行：5h / 周进度条 + 最近的重置倒计时。缺哪个窗口就不画哪个。
-    @ViewBuilder
-    private func remoteQuotaLine(label: String, plan: String, five: QuotaWindow?, weekly: QuotaWindow?) -> some View {
-        HStack(spacing: 6) {
-            Text(plan.isEmpty ? label : "\(label) · \(plan)")
-                .font(VG.scaled(9, weight: .medium))
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-            if let w = five { quotaBar(label: "5H", win: w) }
-            if let w = weekly {
-                if five != nil { dot() }
-                quotaBar(label: "W", win: w)
-            }
-            Spacer(minLength: 2)
-            if let c = Fmt.countdown(to: five?.resetsAt ?? weekly?.resetsAt, now: nowTS) {
-                Text("重置 \(c)")
-                    .font(VG.scaled(8))
-                    .foregroundColor(.secondary)
-                    .fixedSize()
             }
         }
     }
@@ -1798,18 +1775,13 @@ public struct DashboardView: View {
             let shown = expanded ? sorted : Array(sorted.prefix(3))
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(shown) { q in
-                    let pct = q.window.effectivePct(now: nowTS)
                     HStack(spacing: 3) {
                         Text(q.name)
                             .font(VG.scaled(7.5))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                         Spacer(minLength: 2)
-                        MiniProgressBar(value: Double(pct) / 100.0, color: quotaColor(pct), width: 22, height: 3)
-                        Text("\(pct)%")
-                            .font(VG.scaled(7.5, weight: .bold))
-                            .foregroundColor(pct >= 60 ? quotaColor(pct) : .primary)
-                            .fixedSize()
+                        quotaBar(label: "", win: q.window)
                     }
                 }
                 if sorted.count > 3 {
@@ -2084,9 +2056,7 @@ public struct DashboardView: View {
                     HStack(spacing: 4) {
                         Text(item.0).font(VG.scaled(9)).foregroundColor(.secondary).lineLimit(1)
                         Spacer(minLength: 4)
-                        let pct = item.1.effectivePct(now: nowTS)
-                        MiniProgressBar(value: Double(pct) / 100.0, color: quotaColor(pct), width: 40, height: 4)
-                        Text("\(pct)%").font(VG.scaled(9, weight: .bold)).fixedSize()
+                        quotaBar(label: "", win: item.1)
                         if let c = Fmt.countdown(to: item.1.resetsAt, now: nowTS) {
                             Text(c).font(VG.scaled(7.5)).foregroundColor(.secondary).fixedSize()
                         }

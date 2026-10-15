@@ -84,26 +84,37 @@ struct UnifiedQuotaSection: View {
     }
 
     private func platformGroup(_ name: String) -> some View {
-        let rows = readings.filter { platform($0.runtime.name) == name }
-        let visible = expanded.contains(name) ? rows : Array(rows.prefix(2))
+        let rows = readings.filter { platform($0.runtime.name) == name }.sorted { a, b in
+            if a.runtime.hasQuota != b.runtime.hasQuota { return a.runtime.hasQuota }
+            if a.runtime.isRunning != b.runtime.isRunning { return a.runtime.isRunning }
+            if (a.host == nil) != (b.host == nil) { return a.host == nil }
+            return (a.host ?? "") < (b.host ?? "")
+        }
+        let useful = rows.filter { $0.runtime.hasQuota || $0.runtime.isRunning || !$0.runtime.tier.isEmpty }
+        let visible = expanded.contains(name) ? rows : Array(useful.prefix(2))
+        let hidden = rows.count - visible.count
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
                 Circle().fill(tint(name)).frame(width: 7, height: 7)
                 Text(name).font(VG.callout.weight(.semibold))
                 Spacer(minLength: 4)
                 if rows.count > 1 {
-                    Text(L("\(rows.count) 台设备", "\(rows.count) devices"))
+                    Text(L("\(rows.count) 个设备来源", "\(rows.count) device sources"))
                         .font(VG.caption).foregroundStyle(.secondary)
                 }
             }
             ForEach(visible) { reading in
                 deviceReading(reading)
             }
-            if rows.count > 2 {
+            if visible.isEmpty {
+                Text(L("暂无可读取的额度来源", "No quota source available"))
+                    .font(VG.caption).foregroundStyle(.secondary)
+            }
+            if hidden > 0 || expanded.contains(name) {
                 Button {
                     if expanded.contains(name) { expanded.remove(name) } else { expanded.insert(name) }
                 } label: {
-                    Label(expanded.contains(name) ? L("收起设备", "Fewer devices") : L("另外 \(rows.count - 2) 台设备", "\(rows.count - 2) more devices"),
+                    Label(expanded.contains(name) ? L("收起设备", "Fewer devices") : L("查看另外 \(hidden) 个来源", "Show \(hidden) more sources"),
                           systemImage: expanded.contains(name) ? "chevron.up" : "chevron.down")
                         .font(VG.caption).foregroundStyle(.secondary)
                 }
@@ -227,6 +238,7 @@ struct OverviewStrip: View {
     let forecasts: [String: CostForecast]
     let capturedAt: TimeInterval
     let unpricedCount: Int
+    var coverageNote: String? = nil
     var openStats: () -> Void
     var openPrices: () -> Void
 
@@ -277,7 +289,7 @@ struct OverviewStrip: View {
                 }
             }
             HStack(spacing: 4) {
-                Text(updatedText)
+                Text(coverageNote ?? updatedText)
                     .font(VG.caption).foregroundStyle(.tertiary)
                 Spacer()
                 if unpricedCount > 0 {

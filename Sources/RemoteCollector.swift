@@ -319,7 +319,7 @@ enum RemoteCollector {
             let sessions = finiteNumber(row["sessions"]).flatMap { $0 >= 0 && $0 < Double(Int.max) && $0.rounded(.towardZero) == $0 ? Int($0) : nil }
             let sessionUnknown = row["note"] as? String == "session_count_unavailable" || sessions == nil
             let extraName = quota["secondary_name"] as? String ?? ""
-            var runtime = DetectedLLMRuntime(
+            let runtime = DetectedLLMRuntime(
                 name: name, isRunning: !sessionUnknown && (sessions ?? 0) > 0,
                 tier: row["tier"] as? String ?? "",
                 detail: sessionUnknown ? L("会话数未知", "Sessions unknown") : L("\(sessions ?? 0) 会话", "\(sessions ?? 0) sessions"),
@@ -330,7 +330,6 @@ enum RemoteCollector {
                 secondarySevenDay: parseQuotaWindow(quota["secondary_seven_day"], capturedAt: captured),
                 isFullWidth: !extraName.isEmpty,
                 quotaSubtitle: L("未采集到额度", "Quota unavailable"))
-            runtime.quotaNote = L("设备读数 · 账号可能与其他设备相同", "Device reading · account may be shared")
             return runtime
         }
     }

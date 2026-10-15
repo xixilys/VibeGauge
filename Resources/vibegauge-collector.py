@@ -146,8 +146,38 @@ def _collect_opencode(start_ms):
             "out": to_num(row[3]) + to_num(row[4]), "think": to_num(row[4]), "requests": to_num(row[5])}
 
 def _read_claude_usage(home):
-    # 保持旧 claude_usage 字段，但只返回配额窗口和采集时间，不转发任意用户字段。
-    obj = _read_json_bounded(_claude_usage_paths(home), 256 * 1024)
+    # The statusline file remains preferred when it is newer; Claude's own cached
+    # utilization is a bounded fallback and is normalized without account metadata.
+    candidates = []
+    for order, path in enumerate(_claude_usage_paths(home)):
+        obj = _read_json_bounded([path], 256 * 1024)
+        normalized = _normalize_claude_usage(obj)
+        if normalized is not None:
+            candidates.append((normalized.get("_captured_at"), -order, normalized))
+    cache = _read_json_bounded([os.path.join(home, ".claude.json")], 2 * 1024 * 1024)
+    cached = cache.get("cachedUsageUtilization") if isinstance(cache, dict) else None
+    if isinstance(cached, dict):
+        fetched_ms = _finite_number(cached.get("fetchedAtMs"))
+        utilization = cached.get("utilization")
+        if fetched_ms is not None and fetched_ms > 0 and isinstance(utilization, dict):
+            raw = {"_captured_at": fetched_ms / 1000.0}
+            for key in ("five_hour", "seven_day"):
+                window = utilization.get(key)
+                if isinstance(window, dict):
+                    raw[key] = {"used_percentage": window.get("utilization"),
+                                "resets_at": _iso_epoch(window.get("resets_at"))}
+            normalized = _normalize_claude_usage(raw)
+            if normalized is not None:
+                candidates.append((normalized.get("_captured_at"), 0, normalized))
+    if not candidates:
+        return None
+    # Known capture times outrank legacy snapshots without one; among known times,
+    # take the newest valid snapshot. Ties retain the first standard source.
+    return max(candidates, key=lambda item: (item[0] is not None,
+                                              item[0] if item[0] is not None else 0,
+                                              item[1]))[2]
+
+def _normalize_claude_usage(obj):
     if not isinstance(obj, dict):
         return None
     out = {}
@@ -167,7 +197,7 @@ def _read_claude_usage(home):
         if reset is not None:
             win["resets_at"] = reset
         out[key] = win
-    return out
+    return out if any(key != "_captured_at" for key in out) else None
 
 def _finite_number(value):
     if isinstance(value, bool):
@@ -776,12 +806,17 @@ def selftest():
         custom_claude = os.path.join(quota_home, "custom-claude")
         os.makedirs(custom_claude)
         with open(os.path.join(custom_claude, "claude-usage.json"), "w") as fh:
-            json.dump({"five_hour": {"used_percentage": 12}}, fh)
+            json.dump({"_captured_at": 1780000100, "five_hour": {"used_percentage": 12}}, fh)
         old_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
         os.environ["CLAUDE_CONFIG_DIR"] = custom_claude
         assert _read_claude_usage(quota_home)["five_hour"]["used_percentage"] == 12
         if old_claude_config is None: os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else: os.environ["CLAUDE_CONFIG_DIR"] = old_claude_config
+        with open(os.path.join(quota_home, ".claude.json"), "w") as fh:
+            json.dump({"cachedUsageUtilization": {"fetchedAtMs": 1780000010000, "accountUuid": "must-not-leak",
+                "utilization": {"five_hour": {"utilization": 42, "resets_at": "2026-05-29T13:00:00Z"},
+                                "seven_day": {"utilization": 67, "resets_at": "2026-06-05T12:00:00Z"},
+                                "malformed": {"utilization": True}}}, "email": "must-not-leak"}, fh)
         os.makedirs(os.path.join(quota_home, ".grok", "logs"))
         grok = {"ts": "2026-05-29T12:00:00Z", "message": "billing: fetched credits config",
                 "ctx": {"subscriptionTier": "SuperGrok", "config": {"creditUsagePercent": 44,
@@ -814,9 +849,14 @@ def selftest():
             if old_home is None: os.environ.pop("CODEX_HOME", None)
             else: os.environ["CODEX_HOME"] = old_home
         assert set(platforms) == {"claude", "codex", "grok", "agy"}
-        assert platforms["claude"]["quota"]["five_hour"]["used_percentage"] == 31.5
-        assert platforms["claude"]["quota"]["seven_day"]["used_percentage"] == 100
-        assert "account_email" not in (_read_claude_usage(quota_home) or {})
+        assert platforms["claude"]["quota"]["five_hour"]["used_percentage"] == 42
+        assert platforms["claude"]["quota"]["five_hour"]["resets_at"] == _iso_epoch("2026-05-29T13:00:00Z")
+        assert platforms["claude"]["quota"]["seven_day"]["used_percentage"] == 67
+        assert platforms["claude"]["captured_at"] == 1780000010
+        claude_safe = _read_claude_usage(quota_home)
+        assert "accountUuid" not in claude_safe and "email" not in claude_safe
+        assert "malformed" not in claude_safe and "account_email" not in claude_safe
+        assert claude_safe["_captured_at"] - 1780000000 == 10
         assert platforms["grok"]["tier"] == "SuperGrok"
         assert platforms["grok"]["quota"]["seven_day"]["window_seconds"] == 604800
         assert platforms["agy"]["quota"]["five_hour"]["used_percentage"] == 75
@@ -826,6 +866,17 @@ def selftest():
         assert platforms["codex"]["quota"]["seven_day"]["used_percentage"] == 77
         assert "secondary_seven_day" not in platforms["codex"]["quota"]
         assert platforms["agy"]["note"] == "session_count_unavailable"
+        # Older or malformed cached sources must leave the newer applicable snapshot intact.
+        cache_path = os.path.join(quota_home, ".claude.json")
+        with open(cache_path, "w") as fh:
+            json.dump({"cachedUsageUtilization": {"fetchedAtMs": 1779999999000,
+                "utilization": {"five_hour": {"utilization": 88}}}}, fh)
+        assert _read_claude_usage(quota_home)["five_hour"]["used_percentage"] == 31.5
+        with open(cache_path, "w") as fh:
+            json.dump({"cachedUsageUtilization": {"fetchedAtMs": 1780000020000, "accountUuid": "ignored",
+                "utilization": {"five_hour": {"utilization": True}}}}, fh)
+        assert _read_claude_usage(quota_home)["five_hour"]["used_percentage"] == 31.5
+        assert _read_claude_usage(os.path.join(tmp, "missing")) is None
         legacy_home = os.path.join(tmp, "legacy")
         legacy_dir = os.path.join(legacy_home, ".codex", "sessions", codex_day)
         os.makedirs(legacy_dir)

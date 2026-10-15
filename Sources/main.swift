@@ -83,7 +83,23 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
     _ = NSApplication.shared
     NetworkScanner.shared.start()
     UsageHistory.shared.start()
-    let report = ProcessScanner.shared.scan(refreshRemote: false)
+    var report = ProcessScanner.shared.scan(refreshRemote: false)
+    if CommandLine.arguments.contains("--live-devices") {
+        let discovered = DispatchSemaphore(value: 0)
+        RemoteCollector.refreshDiscoveryIfDue(force: true) { discovered.signal() }
+        _ = discovered.wait(timeout: .now() + 6)
+        report.remoteHosts = RemoteCollector.devices()
+        for host in RemoteCollector.hosts() {
+            let attempted = Date().timeIntervalSince1970
+            switch RemoteCollector.pullQuotas(host: host) {
+            case .success(let rows):
+                report.remoteLLMs[host] = rows
+                report.remoteDeviceStatus[host] = RemoteDeviceStatus(lastSuccess: Date().timeIntervalSince1970, lastAttempt: attempted)
+            case .failure(let error):
+                report.remoteDeviceStatus[host] = RemoteDeviceStatus(lastAttempt: attempted, error: error.message)
+            }
+        }
+    }
     var waited = 0.0
     while (UsageHistory.shared.snapshot().capturedAt == 0 || NetworkScanner.shared.snapshot().capturedAt == 0) && waited < 300 {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
@@ -180,6 +196,10 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, resetsAt: now, capturedAt: now - 60), now: now) == .reset)
         precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now + 61), now: now) == .old)
         precondition(QuotaReadingState.evaluate(QuotaWindow(usedPct: 42, capturedAt: now + 60), now: now) == .current)
+        precondition(UsageHistory.remoteSourceNote(cli: "Claude", hasHistory: true, isRefreshing: false, failure: "offline")?.contains("offline") == true)
+        precondition(UsageHistory.remoteSourceNote(cli: "Claude", hasHistory: false, isRefreshing: false, failure: "offline") != UsageHistory.remoteSourceNote(cli: "Claude", hasHistory: true, isRefreshing: false, failure: "offline"))
+        precondition(UsageHistory.remoteSourceNote(cli: "Claude", hasHistory: true, isRefreshing: false, failure: nil) == nil)
+        precondition(UsageHistory.remoteSourceNote(cli: "Claude", hasHistory: true, isRefreshing: true, failure: "offline")?.contains("offline") == false)
     }
     precondition(Fmt.modelDisplayName("claude-fable-5-1") == "Fable 5.1")
     precondition(Fmt.modelDisplayName("claude-opus-5") == "Opus 5")
